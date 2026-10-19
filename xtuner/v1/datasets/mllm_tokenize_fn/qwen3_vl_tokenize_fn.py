@@ -492,6 +492,9 @@ class Qwen3VLTokenizeFunction(BaseMLLMTokenizeFunction):
             position_ids = get_rope_index_3(
                 torch.tensor(input_ids).unsqueeze(0),
                 spatial_merge_size=self.image_processor.merge_size,
+                image_token_id=self.img_context_token_id,
+                video_token_id=self.video_context_token_id,
+                vision_start_token_id=self.img_start_token_id,
             )
 
         input_ids, labels, position_ids = self._truncated_data_item(input_ids, labels, position_ids)
@@ -638,6 +641,9 @@ class Qwen3VLTokenizeFunction(BaseMLLMTokenizeFunction):
                 torch.tensor(input_ids).unsqueeze(0),
                 spatial_merge_size=self.image_processor.merge_size,
                 image_grid_thw=grid_thw,
+                image_token_id=self.img_context_token_id,
+                video_token_id=self.video_context_token_id,
+                vision_start_token_id=self.img_start_token_id,
             )
 
         input_ids, labels, position_ids = self._truncated_data_item(input_ids, labels, position_ids)
@@ -1037,6 +1043,9 @@ class Qwen3VLTokenizeFunction(BaseMLLMTokenizeFunction):
                 torch.tensor(input_ids).unsqueeze(0),
                 spatial_merge_size=self.image_processor.merge_size,
                 video_grid_thw=torch.cat(grid_thw_list),
+                image_token_id=self.img_context_token_id,
+                video_token_id=self.video_context_token_id,
+                vision_start_token_id=self.img_start_token_id,
             )
 
         input_ids, labels, position_ids = self._truncated_data_item(input_ids, labels, position_ids)

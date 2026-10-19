@@ -254,6 +254,7 @@ def build_dataloader(
         dataset,
         batch_size=micro_batch_size,
         num_workers=dataloader_config.num_workers,
+        prefetch_factor=dataloader_config.prefetch_factor,
         # Ensure to round up or drop last based on the `global_batch_size`,
         # if you want to replace a custom sampler.
         sampler=sampler,
@@ -317,6 +318,9 @@ class DataloaderConfig(BaseDataloaderConfig):
         int, Parameter(help="pack extra buffer size when pack_level is expand_soft model")
     ] = 100
     num_workers: Annotated[int, Parameter(help="dataloader num workers")] = 0
+    prefetch_factor: Annotated[
+        int | None, Field(gt=0), Parameter(help="batches prefetched per worker; None keeps the PyTorch default")
+    ] = None
     pad_token_id: Annotated[int | None, Parameter(help="padding token id")] = None
     tokenizer_hash: Annotated[str | None, Parameter(help="tokenizer hash")] = None
     pack_config_path: Annotated[
@@ -328,6 +332,12 @@ class DataloaderConfig(BaseDataloaderConfig):
         Parameter(help="path to sampler order .npy (mmap read); required when pack_level='preset'"),
     ] = None
     round_up: Annotated[bool, Parameter(help="enable or disable round up mode")] = True
+
+    @model_validator(mode="after")
+    def _validate_worker_prefetch(self):
+        if self.prefetch_factor is not None and self.num_workers <= 0:
+            raise ValueError("prefetch_factor requires num_workers > 0")
+        return self
 
     @staticmethod
     def _force_preset_pack_settings(dataset_config_list: "DatasetConfigList") -> "DatasetConfigList":
@@ -567,6 +577,7 @@ class DataloaderConfig(BaseDataloaderConfig):
             dataset,
             batch_size=micro_batch_size,
             num_workers=self.num_workers,
+            prefetch_factor=self.prefetch_factor,
             # Ensure to round up or drop last based on the `global_batch_size`,
             # if you want to replace a custom sampler.
             sampler=sampler,
