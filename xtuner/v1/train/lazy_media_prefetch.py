@@ -4,6 +4,7 @@ The supplied decoder identity is computed on the training thread from its SP mes
 No distributed collective runs in this executor. A running media read cannot be
 cancelled: close waits for it; launcher termination handles a hung external read.
 """
+
 import os
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Iterator
@@ -43,14 +44,20 @@ def take_media_future(plan: dict) -> Future | None:
     return plan.pop("_future", None)
 
 
-def lookahead_iter(base: Iterator[Any], *, decode_here: bool, count: int) -> Iterator[Any]:
+def lookahead_iter(base: Iterator[Any], *, decode_here: bool, count: int, allow_short: bool = False) -> Iterator[Any]:
     if count <= 0:
         return
     pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lazy-media-lookahead")
     pending = None
+    exhausted = object()
 
     def fetch():
-        batch = next(base)
+        try:
+            batch = next(base)
+        except StopIteration:
+            if allow_short:
+                return exhausted
+            raise
         kickoff_lazy_media(batch, decode_here=decode_here)
         return batch
 
@@ -58,6 +65,8 @@ def lookahead_iter(base: Iterator[Any], *, decode_here: bool, count: int) -> Ite
         pending = pool.submit(fetch)
         for index in range(count):
             batch = pending.result()
+            if batch is exhausted:
+                break
             pending = pool.submit(fetch) if index + 1 < count else None
             yield batch
             del batch

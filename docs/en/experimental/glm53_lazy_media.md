@@ -32,3 +32,17 @@ Rebased onto main at 40b3b18 (#2207). The historical table above predates this i
 Current CPU validation: 17 tests passed, including real-processor BF16/FP32 transport parity, OSS, mixed eager fallback, upstream image/video collator tests, and bounded prefetch/cleanup. A four-process CPU Gloo test passed for two SP groups using BF16 transport and injected leader decode errors.
 
 The new six-run GPU/NCCL precision and performance comparison is pending. No new speedup, long-run convergence, full-model parameter-update equality, or 256-GPU validation is claimed for this rebased version. Checkpoint resume, epoch transitions, process failure, and general microbatch workloads need further validation. Keep this PR experimental.
+
+
+## Async prefetch and checkpoint resume
+
+With `XTUNER_LAZY_MEDIA_PREFETCH=1`, fetching a batch no longer counts it as
+consumed. The trainer commits its sample count only after a successful optimizer
+step, before checkpoint saving. Pending or failed batches are replayed on resume.
+Lookahead stays within the current epoch; the main thread advances the epoch only
+after consuming its last batch. Exact epoch-boundary checkpoints record the
+exhausted sampler offset instead of modulo zero, using the existing sampler schema.
+This applies to the built-in Parallel, LengthGrouped and Preset samplers. The
+async-disabled path retains its existing behavior. This does not repair previously
+saved checkpoints whose cursor was already advanced, or guarantee replay of
+arbitrary stochastic worker transforms and their RNG state.

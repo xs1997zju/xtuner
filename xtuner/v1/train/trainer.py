@@ -15,9 +15,7 @@ from pathlib import Path
 from shutil import rmtree
 from typing import (
     Annotated,
-    Any,
     Callable,
-    Iterator,
     Literal,
     Protocol,
     Sequence,
@@ -902,6 +900,8 @@ class Trainer:
 
             internal_metrics = self._maybe_pop_model_internal_metrics(engine_input)
 
+            if getattr(self._dataloader, "_defer_consumption", False):
+                self._dataloader.commit_batch(len(data_batch))
             self._cur_step += 1
             step_tokens = train_step_info["step_consumed_tokens"]
             self._local_total_consumed_tokens += step_tokens
@@ -1512,45 +1512,33 @@ class Trainer:
             yield data
 
     def _prefetched_data_iter(self):
-        # V2c candidate: with XTUNER_LAZY_MEDIA_PREFETCH=1, fetch one batch ahead on a
-        # background thread and kick off lazy media materialization there, overlapping
-        # decode with the previous step's compute. Disabled (default) yields the plain
-        # serial iterator, byte-identical to the upstream loop.
-        #
-        # The batch count is held LOCALLY here: _data_iter's `while self._cur_step <
-        # total_step` gate races when iterated from the lookahead thread (the main thread
-        # advances _cur_step concurrently; the first smoke run over-yielded 2 batches and
-        # trained 5 steps of a 3-step config — evidence in runs/A8-v2c-smoke3).
+        from contextlib import closing
+
         from xtuner.v1.train.lazy_media_prefetch import lazy_media_prefetch_enabled, lookahead_iter
 
-        if lazy_media_prefetch_enabled():
-            remaining = self.total_step - self._cur_step
-
-            def bounded_raw() -> Iterator[Any]:
-                raw = self._raw_data_iter()
-                for _ in range(remaining):
-                    yield next(raw)
-
-            from xtuner.v1.datasets.mllm_tokenize_fn.glm53_vl_tokenize_fn import lazy_media_shared_decode
-            decode_here = not lazy_media_shared_decode() or self.sp_mesh.get_local_rank() == 0
-            logger.info(f"Rank: {self.rank} async media decoder={decode_here}, SP rank={self.sp_mesh.get_local_rank()}")
-            yield from lookahead_iter(bounded_raw(), decode_here=decode_here, count=remaining)
-        else:
+        if not lazy_media_prefetch_enabled():
             yield from self._data_iter()
+            return
 
-    def _raw_data_iter(self) -> Iterator[Any]:
-        # Unbounded per-batch iterator with epoch restart; the CALLER bounds the count
-        # (kept separate from _data_iter so the disabled path stays byte-identical).
-        data_iter = iter(self._dataloader)
-        while True:
-            try:
-                data = next(data_iter)
-            except StopIteration:
+        from xtuner.v1.datasets.mllm_tokenize_fn.glm53_vl_tokenize_fn import lazy_media_shared_decode
+
+        self._dataloader.enable_deferred_consumption()
+        remaining = self.total_step - self._cur_step
+        decode_here = not lazy_media_shared_decode() or self.sp_mesh.get_local_rank() == 0
+        logger.info(f"Rank: {self.rank} async media decoder={decode_here}, SP rank={self.sp_mesh.get_local_rank()}")
+        while remaining > 0:
+            # The producer may exhaust this epoch, but must never advance it.
+            # Checkpoints therefore see the main thread's epoch and only committed
+            # consumption, even when the next batch has already been fetched.
+            with closing(
+                lookahead_iter(iter(self._dataloader), decode_here=decode_here, count=remaining, allow_short=True)
+            ) as batches:
+                for batch in batches:
+                    remaining -= 1
+                    yield batch
+            if remaining:
                 self._cur_epoch += 1
                 self._dataloader.set_epoch(self._cur_epoch)
-                data_iter = iter(self._dataloader)
-                continue
-            yield data
 
     def _get_checkpoint_path(self, epoch: int, step: int, is_snapshot: bool = False) -> Path:
         prefix = "snapshot-" if is_snapshot else "ckpt-"
