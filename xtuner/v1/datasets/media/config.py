@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
 
 class MediaPipelineConfig(BaseModel):
@@ -22,12 +22,21 @@ class MediaPipelineConfig(BaseModel):
     shutdown_timeout_seconds: float = Field(default=30, gt=0, allow_inf_nan=False)
     unsupported_policy: Literal["error", "eager"] = "error"
     source_manifest: str | None = None
+    pixel_dtype: Literal["native", "bfloat16"] = "native"
+
+    @model_serializer(mode="wrap")
+    def serialize_config(self, handler):
+        values = handler(self)
+        if self.pixel_dtype == "native":
+            values.pop("pixel_dtype", None)
+        return values
 
     @model_validator(mode="after")
     def validate_combination(self):
         requested = (
             self.materialization != "eager" or self.per_image or self.decode_threads != 1
             or self.distribution != "local" or self.prefetch_batches != 0
+            or self.pixel_dtype != "native"
         )
         if not self.enabled:
             if requested:

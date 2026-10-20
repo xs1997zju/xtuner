@@ -403,3 +403,179 @@ def test_common_materializer_is_closed_even_on_failure(monkeypatch, fail):
     factory.assert_called_once_with(config)
     instance.materialize.assert_called_once_with(plan)
     instance.close.assert_called_once_with()
+
+
+def _with_pixel_dtype(fixture, pixel_dtype):
+    configured = copy.copy(fixture)
+    configured.config_json = shared.make_image_provider_config(
+        fixture.name, fixture.processor, str(fixture.manifest), pixel_dtype=pixel_dtype
+    )
+    configured.provider = create_provider(fixture.name, configured.config_json)
+    return configured
+
+
+def test_pixel_dtype_config_is_opt_in_and_keeps_native_serialization():
+    native = MediaPipelineConfig()
+    assert native.pixel_dtype == "native"
+    assert "pixel_dtype" not in native.model_dump()
+    assert "pixel_dtype" not in json.loads(native.model_dump_json())
+    assert native.model_dump() == MediaPipelineConfig(pixel_dtype="native").model_dump()
+    enabled_native = _pipeline()
+    bf16 = _pipeline(pixel_dtype="bfloat16")
+    assert bf16.model_dump() == {**enabled_native.model_dump(), "pixel_dtype": "bfloat16"}
+    assert MediaPipelineConfig.model_validate_json(bf16.model_dump_json()) == bf16
+    with pytest.raises(ValueError, match="features require"):
+        MediaPipelineConfig(pixel_dtype="bfloat16")
+    with pytest.raises(ValueError):
+        _pipeline(pixel_dtype="float16")
+
+
+def test_native_pixel_dtype_preserves_config_and_fingerprints(image_fixture):
+    fixture = image_fixture
+    legacy_config = {
+        "identity": shared.image_processor_identity(fixture.name, fixture.processor),
+        "source_manifest": str(fixture.manifest.resolve()),
+        "source_manifest_fingerprint": hashlib.sha256(fixture.manifest.read_bytes()).hexdigest(),
+        "oss_loader_config": None,
+    }
+    explicit_native = _with_pixel_dtype(fixture, "native")
+    assert fixture.config_json == explicit_native.config_json == canonical_json(legacy_config)
+    assert explicit_native.provider.profile_fingerprint == fixture.provider.profile_fingerprint
+    assert explicit_native.provider.processor_fingerprint == fixture.provider.processor_fingerprint
+    assert _plan(explicit_native).fingerprint == _plan(fixture).fingerprint
+
+
+def test_bf16_pixel_dtype_changes_only_transport_identity_and_specs(image_fixture):
+    native = image_fixture
+    bf16 = _with_pixel_dtype(native, "bfloat16")
+    native_config = json.loads(native.config_json)
+    assert json.loads(bf16.config_json) == {**native_config, "pixel_dtype": "bfloat16"}
+    assert bf16.provider.identity == native.provider.identity
+    assert bf16.provider.profile_fingerprint == native.provider.profile_fingerprint
+    assert bf16.provider.manifest_fingerprint == native.provider.manifest_fingerprint
+    assert bf16.provider.processor_fingerprint != native.provider.processor_fingerprint
+    native_plan, bf16_plan = _plan(native), _plan(bf16)
+    assert native_plan.fingerprint != bf16_plan.fingerprint
+    assert bf16_plan.source_manifest_fingerprint == native_plan.source_manifest_fingerprint
+    assert bf16_plan.output_specs[0] == replace(native_plan.output_specs[0], dtype="bfloat16")
+    assert bf16_plan.output_specs[1] == native_plan.output_specs[1]
+    for entry in bf16_plan.entries:
+        certified_peak = sum(bf16.provider._profile(source)["estimated_peak_bytes"] for source in entry.sources)
+        assert entry.estimated_peak_bytes == certified_peak + sum(spec.nbytes for spec in entry.output_specs)
+    with pytest.raises(ValueError, match="identities"):
+        bf16.provider.merge_plans([bf16_plan, native_plan])
+
+
+@pytest.mark.parametrize("per_image", (False, True))
+def test_bf16_pixel_dtype_casts_after_native_processor_before_assembly(image_fixture, per_image):
+    native = image_fixture
+    bf16 = _with_pixel_dtype(native, "bfloat16")
+    certificate_bytes = native.manifest.read_bytes()
+    native_plan, bf16_plan = _plan(native, per_image), _plan(bf16, per_image)
+    native_outputs = [native.provider.process(entry) for entry in native_plan.entries]
+    bf16_outputs = [bf16.provider.process(entry) for entry in bf16_plan.entries]
+    assert len(native_outputs) == len(bf16_outputs)
+    for native_output, bf16_output in zip(native_outputs, bf16_outputs):
+        native_pixels = native_output.tensors["pixel_values"]
+        bf16_pixels = bf16_output.tensors["pixel_values"]
+        assert native_pixels.dtype == torch.float32
+        assert bf16_pixels.dtype == torch.bfloat16
+        assert bf16_pixels.device.type == "cpu"
+        assert torch.equal(bf16_pixels.view(torch.int16), native_pixels.to(torch.bfloat16).view(torch.int16))
+        assert torch.equal(bf16_output.tensors["image_grid_thw"], native_output.tensors["image_grid_thw"])
+        assert bf16_output.tensors["image_grid_thw"].dtype == torch.int64
+        assert bf16_output.metadata == native_output.metadata
+    assembled = bf16.provider.assemble(bf16_plan, bf16_outputs)
+    expected_pixels = torch.cat([output.tensors["pixel_values"].to(torch.bfloat16) for output in native_outputs])
+    assert torch.equal(assembled.tensors["pixel_values"].view(torch.int16), expected_pixels.view(torch.int16))
+    assert assembled.nbytes == assembled.storage_bytes == bf16_plan.output_bytes
+    assert native.manifest.read_bytes() == certificate_bytes
+
+
+@pytest.mark.parametrize("mutation", ("dtype", "shape", "grid"))
+def test_bf16_pixel_dtype_rejects_invalid_native_output_before_cast(image_fixture, mutation):
+    fixture = _with_pixel_dtype(image_fixture, "bfloat16")
+    processed = {
+        name: image_fixture.native_outputs[0][name].clone() for name in ("pixel_values", "image_grid_thw")
+    }
+    if mutation == "dtype":
+        processed["pixel_values"] = processed["pixel_values"].to(torch.bfloat16)
+    elif mutation == "shape":
+        processed["pixel_values"] = processed["pixel_values"][:-1]
+    else:
+        processed["image_grid_thw"][:, 1:] = processed["image_grid_thw"][:, 1:].flip(-1)
+    plan = _plan(fixture)
+    with patch.object(fixture.provider, "_preprocess", return_value=processed):
+        with pytest.raises(ValueError, match="shape/dtype|native grid"):
+            fixture.provider.process(plan.entries[0])
+
+
+def test_bf16_pixel_dtype_keeps_native_certificate_peak_floor(image_fixture):
+    fixture = image_fixture
+    certificates = copy.deepcopy(fixture.certificates)
+    certificate = certificates[0]
+    native_output = fixture.native_outputs[0]
+    minimum_peak = sum(
+        native_output[name].numel() * native_output[name].element_size() for name in ("pixel_values", "image_grid_thw")
+    )
+    minimum_peak += certificate["source_bytes"] + certificate["width"] * certificate["height"] * 3
+    certificate["profiles"][fixture.profile_key]["estimated_peak_bytes"] = minimum_peak - 1
+    manifest = fixture.manifest.with_name("underreserved-certificates.json")
+    manifest.write_text(canonical_json({"schema_version": 1, "sources": certificates}))
+    provider = create_provider(
+        fixture.name,
+        shared.make_image_provider_config(fixture.name, fixture.processor, str(manifest), pixel_dtype="bfloat16"),
+    )
+    with patch.object(Image, "open", side_effect=AssertionError("invalid peak must fail before decode")):
+        with pytest.raises(ValueError, match="peak reservation is smaller"):
+            sources = provider.sources_for_uris([certificate["uri"]])
+            provider.describe(
+                sources, occurrence_id="bad-peak", per_image=True,
+                source_manifest_fingerprint=provider.manifest_fingerprint,
+            )
+
+
+def test_bf16_pixel_dtype_materializer_transport_schema_and_proof_agree(image_fixture):
+    from xtuner.v1.datasets.media.runtime import MediaRuntime
+    from xtuner.v1.datasets.media.schema import MediaDeliveryProof
+
+    fixture = _with_pixel_dtype(image_fixture, "bfloat16")
+    plan = _plan(fixture)
+    pipeline = _pipeline(fixture.manifest, pixel_dtype="bfloat16", per_image=True, decode_threads=2)
+    with MediaRuntime(pipeline) as runtime:
+        with runtime.consume(plan, key="bf16-parity", device="cpu") as media:
+            media.validate(plan.output_specs)
+            assert media.tensors["pixel_values"].dtype == torch.bfloat16
+            assert media.tensors["image_grid_thw"].dtype == torch.int64
+            assert media.nbytes == plan.output_bytes
+            document = json.loads(runtime._transport._schema(plan, media.metadata))
+            assert {spec["name"]: spec["dtype"] for spec in document["specs"]} == {
+                "pixel_values": "bfloat16", "image_grid_thw": "int64",
+            }
+            proof = MediaDeliveryProof("bf16-parity", plan.fingerprint, plan.output_specs)
+            proof.validate_context(SimpleNamespace(**media.tensors))
+            mismatched = {**media.tensors, "pixel_values": media.tensors["pixel_values"].float()}
+            with pytest.raises(ValueError, match="dtype changed"):
+                proof.validate_context(SimpleNamespace(**mismatched))
+    assert runtime.metrics["host_reserved_bytes"] == 0
+
+
+def test_bf16_pixel_dtype_is_forwarded_to_provider(image_fixture):
+    tokenize_fn = _tokenize_instance(image_fixture)
+    tokenize_fn.media_pipeline = _pipeline(image_fixture.manifest, pixel_dtype="bfloat16")
+    provider = shared.initialize_image_provider(tokenize_fn, image_fixture.name)
+    assert provider.pixel_dtype == "bfloat16"
+    assert json.loads(provider.config_json)["pixel_dtype"] == "bfloat16"
+    assert provider.profile_fingerprint == image_fixture.profile_key
+
+
+def test_pixel_dtype_rejects_unknown_provider_values(image_fixture):
+    fixture = image_fixture
+    with pytest.raises(ValueError, match="pixel_dtype"):
+        shared.make_image_provider_config(
+            fixture.name, fixture.processor, str(fixture.manifest), pixel_dtype="float16"
+        )
+    config = json.loads(fixture.config_json)
+    config["pixel_dtype"] = "float16"
+    with pytest.raises(ValueError, match="pixel_dtype"):
+        create_provider(fixture.name, canonical_json(config))

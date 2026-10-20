@@ -2,9 +2,10 @@ import hashlib
 import io
 import json
 import math
+from dataclasses import replace
 from importlib import import_module
 from pathlib import Path
-from typing import Sequence
+from typing import Literal, Sequence
 
 from ..provider import ProviderCapabilities, create_provider
 from ..schema import MaterializedMedia, MediaEntry, MediaPlan, MediaSource, TensorSpec, canonical_json
@@ -31,18 +32,27 @@ def image_profile_fingerprint(identity: dict) -> str:
     return hashlib.sha256(canonical_json(identity).encode()).hexdigest()
 
 
-def make_image_provider_config(provider: str, processor, source_manifest: str | None, oss_loader_config=None) -> str:
+def make_image_provider_config(
+    provider: str,
+    processor,
+    source_manifest: str | None,
+    oss_loader_config=None,
+    pixel_dtype: Literal["native", "bfloat16"] = "native",
+) -> str:
+    if pixel_dtype not in ("native", "bfloat16"):
+        raise ValueError("unsupported image pixel_dtype")
     if source_manifest is None:
         raise UnsupportedMediaSource("optimized images require a certified source_manifest")
     manifest_path = str(Path(source_manifest).resolve())
-    return canonical_json(
-        {
-            "identity": image_processor_identity(provider, processor),
-            "source_manifest": manifest_path,
-            "source_manifest_fingerprint": hashlib.sha256(Path(manifest_path).read_bytes()).hexdigest(),
-            "oss_loader_config": oss_loader_config,
-        }
-    )
+    config = {
+        "identity": image_processor_identity(provider, processor),
+        "source_manifest": manifest_path,
+        "source_manifest_fingerprint": hashlib.sha256(Path(manifest_path).read_bytes()).hexdigest(),
+        "oss_loader_config": oss_loader_config,
+    }
+    if pixel_dtype != "native":
+        config["pixel_dtype"] = pixel_dtype
+    return canonical_json(config)
 
 
 def _combined_specs(spec_groups: Sequence[tuple[TensorSpec, ...]]) -> tuple[TensorSpec, ...]:
@@ -75,6 +85,9 @@ class CertifiedImageProvider:
     def __init__(self, processor_config_json: str):
         self.config_json = canonical_json(json.loads(processor_config_json))
         self.config = json.loads(self.config_json)
+        self.pixel_dtype = self.config.get("pixel_dtype", "native")
+        if self.pixel_dtype not in ("native", "bfloat16"):
+            raise ValueError("unsupported image pixel_dtype")
         self.identity = self.config["identity"]
         if self.identity["provider"] != self.name:
             raise ValueError("image provider identity mismatch")
@@ -168,7 +181,7 @@ class CertifiedImageProvider:
             raise UnsupportedMediaSource(f"uncertified image processor profile: {uri}")
         return certificate
 
-    def _source_specs(self, source: MediaSource) -> tuple[TensorSpec, ...]:
+    def _native_source_specs(self, source: MediaSource) -> tuple[TensorSpec, ...]:
         profile = self._profile(source)
         grid = profile["image_grid_thw"]
         pixel = profile["pixel_values"]
@@ -185,6 +198,12 @@ class CertifiedImageProvider:
         if type(profile["estimated_peak_bytes"]) is not int or profile["estimated_peak_bytes"] < minimum_peak:
             raise ValueError("certificate peak reservation is smaller than decoded RGB and output")
         return specs
+
+    def _source_specs(self, source: MediaSource) -> tuple[TensorSpec, ...]:
+        specs = self._native_source_specs(source)
+        if self.pixel_dtype == "native":
+            return specs
+        return tuple(replace(spec, dtype="bfloat16") if spec.name == "pixel_values" else spec for spec in specs)
 
     def describe(
         self,
@@ -270,11 +289,20 @@ class CertifiedImageProvider:
                 {name: processed[name] for name in ("pixel_values", "image_grid_thw")},
                 metadata={"occurrence_id": entry.occurrence_id},
             )
-            result.validate(entry.output_specs)
+            native_specs = (
+                expected_specs if self.pixel_dtype == "native"
+                else _combined_specs([self._native_source_specs(source) for source in entry.sources])
+            )
+            result.validate(native_specs)
             if result.tensors["image_grid_thw"].tolist() != [
                 self._profile(source)["image_grid_thw"] for source in entry.sources
             ]:
                 raise ValueError("actual native grid differs from certified grid")
+            if self.pixel_dtype == "bfloat16":
+                import torch
+
+                result.tensors["pixel_values"] = result.tensors["pixel_values"].to(torch.bfloat16)
+                result.validate(entry.output_specs)
             return result
         finally:
             for image in images:
@@ -370,6 +398,7 @@ def initialize_image_provider(tokenize_fn, provider_name: str):
             tokenize_fn.image_processor,
             config.source_manifest,
             getattr(tokenize_fn, "_media_oss_loader_config", None),
+            pixel_dtype=config.pixel_dtype,
         )
     except UnsupportedMediaSource:
         if config.unsupported_policy == "eager":
