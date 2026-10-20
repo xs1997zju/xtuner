@@ -40,6 +40,7 @@ from xtuner.v1.module.rope import RopeScalingConfig
 from xtuner.v1.ops.act_fn import get_act_fn, get_gated_act_fn
 from xtuner.v1.ops.fp32_linear import fp32_linear
 from xtuner.v1.utils import ForwardState
+from xtuner.v1.utils.profile import layer_profile_name, profile_bw_close, profile_bw_open, profile_range
 
 from ..linear import build_linear
 
@@ -393,31 +394,37 @@ class MoEDecoderLayer(nn.Module):
             results. Scalar fields for a single ``hidden_states`` tensor, per-micro-batch lists for
             a list of them.
         """
-        if not isinstance(hidden_states, list):
-            assert isinstance(seq_ctx, SequenceContext), (
-                f"seq_ctx should be a SequenceContext instance but got {seq_ctx}"
+        with profile_range(2, layer_profile_name(self.layer_idx)):
+            hidden_states = profile_bw_close(hidden_states)
+            if not isinstance(hidden_states, list):
+                assert isinstance(seq_ctx, SequenceContext), (
+                    f"seq_ctx should be a SequenceContext instance but got {seq_ctx}"
+                )
+                assert isinstance(position_embeddings, tuple) and len(position_embeddings) == 2, (
+                    "position_embeddings should be a tuple of two tensors (position_ids, position_embeds)"
+                )
+                single = self._forward(
+                    hidden_states=hidden_states,
+                    seq_ctx=seq_ctx,
+                    position_embeddings=position_embeddings,
+                )
+                single["hidden_states"] = profile_bw_open(single["hidden_states"], f"layer{self.layer_idx + 1}")
+                return single
+
+            assert isinstance(seq_ctx, list) and len(seq_ctx) == len(hidden_states), (
+                "seq_ctx should be a list of SequenceContext instances with the same length as hidden_states"
             )
-            assert isinstance(position_embeddings, tuple) and len(position_embeddings) == 2, (
-                "position_embeddings should be a tuple of two tensors (position_ids, position_embeds)"
-            )
-            return self._forward(
-                hidden_states=hidden_states,
-                seq_ctx=seq_ctx,
-                position_embeddings=position_embeddings,
+            assert isinstance(position_embeddings, list) and len(position_embeddings) == len(hidden_states), (
+                "position_embeddings should be a list of tuples with the same length as hidden_states"
             )
 
-        assert isinstance(seq_ctx, list) and len(seq_ctx) == len(hidden_states), (
-            "seq_ctx should be a list of SequenceContext instances with the same length as hidden_states"
-        )
-        assert isinstance(position_embeddings, list) and len(position_embeddings) == len(hidden_states), (
-            "position_embeddings should be a list of tuples with the same length as hidden_states"
-        )
-
-        return self._micro_batch_forward(
-            hidden_states_list=hidden_states,
-            seq_ctx_list=seq_ctx,
-            position_embeddings_list=position_embeddings,
-        )
+            batch = self._micro_batch_forward(
+                hidden_states_list=hidden_states,
+                seq_ctx_list=seq_ctx,
+                position_embeddings_list=position_embeddings,
+            )
+            batch["hidden_states"] = profile_bw_open(batch["hidden_states"], f"layer{self.layer_idx + 1}")
+            return batch
 
     def _hf_expert_forward_for_debug(self, hidden_states: torch.Tensor, router_results: RouterResults, origin_shape):
         # xtuner: num_experts * 2 * expert_dim, hidden_size

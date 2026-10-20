@@ -65,6 +65,7 @@ from xtuner.v1.utils import (
     is_hf_model_path,
     log_format,
     log_rank0,
+    profile_range,
     profile_time_and_memory,
     record_git_info,
     set_deterministic,
@@ -874,7 +875,8 @@ class Trainer:
             DEVICE_MODULE.reset_peak_memory_stats()
 
             with self._maybe_profiling():
-                engine_input = self._prepare_model_input(data_batch)
+                with profile_range(1, "prepare_input"):
+                    engine_input = self._prepare_model_input(data_batch)
                 train_step_info = self._engine.train_step(engine_input)
                 hooks = self.hooks_config.get_hooks(HookStage.AFTER_TRAIN_STEP)
                 for hook in hooks:

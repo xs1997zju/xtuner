@@ -78,7 +78,11 @@ GLM53_MOE_NON_EP_COMPILE_CFG: dict[str, TorchCompileOption] = {
     "xtuner.v1.module.decoder_layer.moe_decoder_layer.MoEDecoderLayer._shared_experts_forward": TorchCompileOption(
         fullgraph=True
     ),
-    "xtuner.v1.model.moe.glm53.decoder_layer.Glm53DenseDecoderLayer._forward": TorchCompileOption(fullgraph=False),
+    # Keep L3 attention/MLP ranges in the eager wrapper and compile their bodies.
+    "xtuner.v1.model.moe.glm53.decoder_layer.Glm53DenseDecoderLayer._attn_forward": TorchCompileOption(
+        fullgraph=False
+    ),
+    "xtuner.v1.model.moe.glm53.decoder_layer.Glm53DenseDecoderLayer._ffn_forward": TorchCompileOption(fullgraph=False),
     **DEFAULT_FLOAT8_CFG,
 }
 

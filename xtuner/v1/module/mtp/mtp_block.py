@@ -10,6 +10,7 @@ from xtuner.v1.module.decoder_layer.moe_decoder_layer import (
     MoEDecoderLayerMicroBatchOutput,
     MoEDecoderLayerOutput,
 )
+from xtuner.v1.utils.profile import profile_embedding, profile_range
 
 from .config import MTPConfig
 from .mtp_layer import MTPLayer
@@ -183,12 +184,12 @@ class MTPBlock(nn.Module):
         num_steps = self.mtp_config.num_layers
         for step in range(num_steps):
             layer = cast(MTPLayer, self.layers[0] if self.mtp_config.share_weights else self.layers[step])
-            current_seq_ctx, future_embeddings = self._next_future_inputs(
-                current_seq_ctx, embed_tokens_fn, depth=step + 1, raw_inputs_embeds=raw_inputs_embeds
-            )
-
-            if self.mtp_config.detach_mtp_inputs:
-                future_embeddings = future_embeddings.detach()
+            with profile_range(2, f"mtp{step + 1}.embed"):
+                current_seq_ctx, future_embeddings = self._next_future_inputs(
+                    current_seq_ctx, embed_tokens_fn, depth=step + 1, raw_inputs_embeds=raw_inputs_embeds
+                )
+                if self.mtp_config.detach_mtp_inputs:
+                    future_embeddings = future_embeddings.detach()
 
             layer_results = cast(
                 MoEDecoderLayerOutput,
@@ -262,12 +263,13 @@ class MTPBlock(nn.Module):
         for step in range(num_steps):
             layer = cast(MTPLayer, self.layers[0] if self.mtp_config.share_weights else self.layers[step])
 
-            future_inputs = [
-                self._next_future_inputs(ctx, embed_tokens_fn, depth=step + 1, raw_inputs_embeds=raw)
-                for ctx, raw in zip(current_seq_ctx_list, raw_inputs_embeds_list)
-            ]
-            current_seq_ctx_list = [ctx for ctx, _ in future_inputs]
-            future_embeddings_list = [embeds for _, embeds in future_inputs]
+            with profile_range(2, f"mtp{step + 1}.embed"):
+                future_inputs = [
+                    self._next_future_inputs(ctx, embed_tokens_fn, depth=step + 1, raw_inputs_embeds=raw)
+                    for ctx, raw in zip(current_seq_ctx_list, raw_inputs_embeds_list)
+                ]
+                current_seq_ctx_list = [ctx for ctx, _ in future_inputs]
+                future_embeddings_list = [embeds for _, embeds in future_inputs]
 
             layer_results = cast(
                 MoEDecoderLayerMicroBatchOutput,
@@ -335,5 +337,6 @@ class MTPBlock(nn.Module):
         embed_tokens_fn: Callable[[torch.Tensor], torch.Tensor],
     ) -> torch.Tensor:
         if seq_ctx.inputs_embeds is None:
-            return embed_tokens_fn(seq_ctx.input_ids)  # type: ignore[arg-type]
+            assert seq_ctx.input_ids is not None
+            return profile_embedding(embed_tokens_fn, seq_ctx.input_ids)
         return seq_ctx.inputs_embeds

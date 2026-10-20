@@ -12,6 +12,7 @@ from xtuner.v1.module.decoder_layer.moe_decoder_layer import (
     MoEDecoderLayerOutput,
 )
 from xtuner.v1.module.linear import build_linear
+from xtuner.v1.utils.profile import mtp_profile_name, profile_bw_close, profile_bw_open, profile_range
 
 
 class MTPLayer(nn.Module):
@@ -63,9 +64,11 @@ class MTPLayer(nn.Module):
         rms_norm_type: Literal["default", "zero_centered"],
         decoder_layer: nn.Module,
         float8_cfg=None,
+        mtp_idx: int = 0,
     ):
         super().__init__()
         self.hidden_size = hidden_size
+        self.mtp_idx = mtp_idx
 
         # MTP-specific preprocessing components
         self.enorm = RMSNorm(hidden_size, eps=rms_norm_eps, type=rms_norm_type)
@@ -121,12 +124,19 @@ class MTPLayer(nn.Module):
             assert isinstance(position_embeddings, tuple) and len(position_embeddings) == 2, (
                 "position_embeddings should be a (cos, sin) tuple in single-microbatch mode"
             )
-            return self._forward(
-                hidden_states=hidden_states,
-                future_embeddings=future_embeddings,
-                position_embeddings=position_embeddings,
-                seq_ctx=seq_ctx,
-            )
+            with profile_range(2, mtp_profile_name(self.mtp_idx)):
+                hidden_states = profile_bw_close(hidden_states)
+                future_embeddings = profile_bw_close(future_embeddings)
+                single_output = self._forward(
+                    hidden_states=hidden_states,
+                    future_embeddings=future_embeddings,
+                    position_embeddings=position_embeddings,
+                    seq_ctx=seq_ctx,
+                )
+                single_output["hidden_states"] = profile_bw_open(
+                    single_output["hidden_states"], f"mtp{self.mtp_idx + 1}"
+                )
+                return single_output
 
         assert isinstance(future_embeddings, list), (
             "future_embeddings should be a list aligned with hidden_states in multi-microbatch mode"
@@ -137,12 +147,17 @@ class MTPLayer(nn.Module):
         assert isinstance(position_embeddings, list), (
             "position_embeddings should be a list aligned with hidden_states in multi-microbatch mode"
         )
-        return self._micro_batch_forward(
-            hidden_states_list=hidden_states,
-            future_embeddings_list=future_embeddings,
-            position_embeddings_list=position_embeddings,
-            seq_ctx_list=seq_ctx,
-        )
+        with profile_range(2, mtp_profile_name(self.mtp_idx)):
+            hidden_states = profile_bw_close(hidden_states)
+            future_embeddings = profile_bw_close(future_embeddings)
+            mb_output = self._micro_batch_forward(
+                hidden_states_list=hidden_states,
+                future_embeddings_list=future_embeddings,
+                position_embeddings_list=position_embeddings,
+                seq_ctx_list=seq_ctx,
+            )
+            mb_output["hidden_states"] = profile_bw_open(mb_output["hidden_states"], f"mtp{self.mtp_idx + 1}")
+            return mb_output
 
     def _forward(
         self,

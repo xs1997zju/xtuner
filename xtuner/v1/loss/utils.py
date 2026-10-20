@@ -27,7 +27,10 @@ def sp_split(
 def sp_gather(tensor, sp_mesh: DeviceMesh, dim: int):
     if sp_mesh.size() == 1:
         return tensor
-    tensor_list = dist.all_gather(tensor, group=sp_mesh.get_group())
+    from xtuner.v1.utils.profile import profile_range
+
+    with profile_range(3, "sp_all_gather"):
+        tensor_list = dist.all_gather(tensor, group=sp_mesh.get_group())
     return torch.cat(tensor_list, dim=dim)
 
 

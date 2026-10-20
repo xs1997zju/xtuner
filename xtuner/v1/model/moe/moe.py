@@ -19,6 +19,7 @@ from torch.distributed.fsdp import (
     MixedPrecisionPolicy,
 )
 from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
+from torch.distributed.tensor.placement_types import _StridedShard
 from tqdm import tqdm
 from typing_extensions import overload, override
 
@@ -85,6 +86,7 @@ from xtuner.v1.utils import (
     log_rank0,
 )
 from xtuner.v1.utils.activation_offload import async_save_on_cpu
+from xtuner.v1.utils.profile import profile_embedding
 from xtuner.v1.utils.router_offload import async_offload_to_cpu
 
 
@@ -260,7 +262,7 @@ class MoE(BaseModel):
             self.expert_tp_mesh = None
             self.ep_tp_mesh = None
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, type=config.rms_norm_type)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, type=config.rms_norm_type, l2_name="norm")
         self.lm_head = LMHead(config.hidden_size, config.vocab_size, bias=False)
 
         self.layers = self.build_layers(config)
@@ -681,7 +683,7 @@ class MoE(BaseModel):
             cat_hidden_states = torch.cat([ctx.inputs_embeds for ctx in seq_ctx_list], dim=1)  # type: ignore
         else:
             cat_input_ids = torch.cat([ctx.input_ids for ctx in seq_ctx_list], dim=1)  # type: ignore
-            cat_hidden_states = self.embed_tokens(cat_input_ids)
+            cat_hidden_states = profile_embedding(self.embed_tokens, cat_input_ids)
         # M-RoPE position_ids are 3D [axes, batch, seq] for VL while text-only ones are 2D
         # [batch, seq]; -1 selects the seq dim in both cases. Hard-coded dim=1 was a text-only
         # assumption and produced a wrong-length cos/sin for VL under intra_layer_micro_batch.
@@ -955,7 +957,7 @@ class MoE(BaseModel):
         position_ids = seq_ctx.position_ids
 
         if input_ids is not None:
-            hidden_states = self.embed_tokens(input_ids)
+            hidden_states = profile_embedding(self.embed_tokens, input_ids)
         else:
             assert seq_ctx.inputs_embeds is not None, "inputs_embeds should not be None when input_ids is None"
             # The clone here is mainly for ActivationOffload. The current offload implementation modifies
@@ -1361,6 +1363,7 @@ class MoE(BaseModel):
                 rms_norm_type=config.rms_norm_type,
                 decoder_layer=decoder_layer,
                 float8_cfg=config.float8_cfg,
+                mtp_idx=i,
             )
             mtp_layers.append(mtp_layer)
 
@@ -1641,7 +1644,7 @@ class MoE(BaseModel):
             local_norm_squared = torch.linalg.vector_norm(local_grad, ord=2.0, dtype=dtype) ** 2
             if isinstance(grad, DTensor):
                 for i, placement in enumerate(grad.placements):
-                    if isinstance(placement, Shard):
+                    if isinstance(placement, (Shard, _StridedShard)):
                         dist.all_reduce(local_norm_squared, group=grad.device_mesh.get_group(i))
                     elif isinstance(placement, Replicate):
                         pass

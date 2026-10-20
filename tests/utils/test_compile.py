@@ -1,5 +1,5 @@
-from ast import literal_eval
 import re
+from ast import literal_eval
 
 import pytest
 import torch
@@ -16,7 +16,11 @@ from xtuner.v1.model import (
 from xtuner.v1.model.moe.moe import MOE_EP_COMPILE_CFG, MOE_NON_EP_COMPILE_CFG, MoE
 from xtuner.v1.model.moe.qwen3_5_text import (
     MOE_EP_COMPILE_CFG as QWEN35_MOE_EP_COMPILE_CFG,
+)
+from xtuner.v1.model.moe.qwen3_5_text import (
     MOE_NON_EP_COMPILE_CFG as QWEN35_MOE_NON_EP_COMPILE_CFG,
+)
+from xtuner.v1.model.moe.qwen3_5_text import (
     Qwen3_5_VLTextMoE,
     Qwen3_5_VLTextMoE35BA3BConfig,
 )
@@ -27,9 +31,24 @@ from xtuner.v1.module.dispatcher.base import (
     NaivePreDispatchResult,
 )
 from xtuner.v1.utils import get_logger
+from xtuner.v1.utils.compile import is_compiled_function, wrap_with_profile_range
 
 
 logger = get_logger()
+
+
+def test_wrap_with_profile_range_preserves_compile_marker_and_records_name():
+    def compiled_function(value):
+        return value + 1
+
+    compiled_function.get_compiler_config = lambda: {}
+    wrapped = wrap_with_profile_range(compiled_function, "tests.utils.test_compile.compiled_function")
+
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profiler:
+        assert wrapped(torch.tensor(1)) == 2
+
+    assert is_compiled_function(wrapped)
+    assert any(event.name == "compile:tests.utils.test_compile.compiled_function" for event in profiler.events())
 
 
 @pytest.mark.parametrize("model_cfg", [

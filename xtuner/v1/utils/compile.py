@@ -1,3 +1,4 @@
+import functools
 from types import FunctionType
 from typing import Callable, Generic, cast
 
@@ -5,7 +6,7 @@ import torch
 
 from .device import get_device
 from .logger import get_logger, log_rank0
-from .misc import FunctionEnum, get_function_type
+from .misc import FunctionEnum, get_function_full_qualname, get_function_type
 from .type_helper import P, T
 
 
@@ -47,7 +48,10 @@ class MaybeCompile(Generic[P, T]):
     def enable_compile(self, **compile_options) -> None:
         """Enable torch.compile with the given arguments."""
         if not is_compiled_function(self.func):
-            self.func = torch.compile(self.origin_func, **compile_options)
+            compiled = torch.compile(self.origin_func, **compile_options)
+            self.func = wrap_with_profile_range(
+                compiled, get_function_full_qualname(cast(FunctionType, self.origin_func))
+            )
 
     def disable_compile(self) -> None:
         """Disable torch.compile, reverting to the original function."""
@@ -58,6 +62,32 @@ class MaybeCompile(Generic[P, T]):
 def is_compiled_function(func: Callable) -> bool:
     """Check if a function has been compiled using torch.compile."""
     return hasattr(func, "get_compiler_config")
+
+
+def wrap_with_profile_range(fn: Callable[P, T], qualname: str) -> Callable[P, T]:
+    """Wrap a compiled function in a named profiler range.
+
+    Inductor-generated kernel names do not retain the source compile target.
+    This eager shim adds a ``compile:<qualname>`` range around the compiled
+    callable, allowing profiler viewers to group its kernels by source method.
+    The shim is outside the compiled region and is effectively free when no
+    profiler is active. Compile-marker attributes are forwarded so repeated
+    compile resolution does not wrap the function again.
+    """
+    range_name = f"compile:{qualname}"
+
+    @functools.wraps(fn)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+        with torch.profiler.record_function(range_name):
+            return fn(*args, **kwargs)
+
+    for attr in ("get_compiler_config", "_torchdynamo_inline"):
+        if hasattr(fn, attr):
+            try:
+                setattr(wrapper, attr, getattr(fn, attr))
+            except (AttributeError, TypeError):
+                pass
+    return wrapper
 
 
 # Create a singleton instance

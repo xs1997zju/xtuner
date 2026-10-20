@@ -7,6 +7,7 @@ from torch.distributed.tensor import DTensor
 from typing_extensions import overload
 
 from xtuner.v1.loss.ce_loss import LMHeadLossContext
+from xtuner.v1.utils.profile import attach_l2_backward, profile_range
 
 
 Loss: TypeAlias = torch.Tensor
@@ -43,12 +44,15 @@ class LMHead(nn.Linear):
         else:
             w = self.weight
             b = self.bias
+        with profile_range(2, "lm_head.forward"):
+            if loss_ctx is None:
+                assert isinstance(hidden_states, torch.Tensor)
+                logits = F.linear(hidden_states, w, b)
+            else:
+                loss, rest = loss_ctx.forward(hidden_states, w, b)  # type: ignore[arg-type]
         if loss_ctx is None:
-            assert isinstance(hidden_states, torch.Tensor)
-            logits = F.linear(hidden_states, w, b)
-            return None, (logits.float(), {})
-        else:
-            return loss_ctx.forward(hidden_states, w, b)  # type: ignore[arg-type]
+            return None, (attach_l2_backward(logits, "lm_head").float(), {})
+        return attach_l2_backward(loss, "lm_head"), rest
 
     @overload  # type: ignore
     def __call__(

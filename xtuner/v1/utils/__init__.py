@@ -21,7 +21,16 @@ from .misc import (
     trim_memory,
 )
 from .pad import pad_to_max_length, pad_to_multiple_of
-from .profile import profile_time, profile_time_and_memory, timer, timer_logger
+from .profile import (
+    profile_bw_close,
+    profile_bw_open,
+    profile_range,
+    profile_time,
+    profile_time_and_memory,
+    profiled_item,
+    timer,
+    timer_logger,
+)
 from .state import ForwardState
 from .type_helper import copy_method_signature, copy_signature, ray_method
 from .update_weights_utils import monkey_unpatch_torch_reductions
@@ -62,6 +71,10 @@ __all__ = [
     "IGNORE_INDEX",
     "monkey_unpatch_torch_reductions",
     "ray_method",
+    "profile_range",
+    "profiled_item",
+    "profile_bw_close",
+    "profile_bw_open",
     "profile_time",
     "clean_param_name",
     "set_deterministic",

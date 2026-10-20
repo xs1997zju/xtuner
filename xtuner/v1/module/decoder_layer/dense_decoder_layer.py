@@ -10,6 +10,7 @@ from xtuner.v1.module import AttnOutputs, GatedDeltaNetConfig, KDAConfig, MHACon
 from xtuner.v1.module.rope import RopeScalingConfig
 from xtuner.v1.ops.act_fn import get_gated_act_fn
 from xtuner.v1.utils import ForwardState
+from xtuner.v1.utils.profile import layer_profile_name, profile_bw_close, profile_bw_open, profile_range
 
 from ..linear import build_linear
 
@@ -94,6 +95,7 @@ class DenseDecoderLayer(nn.Module):
         )
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps, type=rms_norm_type)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps, type=rms_norm_type)
+        self.layer_idx = layer_idx
 
     def forward(
         self,
@@ -120,22 +122,22 @@ class DenseDecoderLayer(nn.Module):
             single tensor for a single ``hidden_states`` tensor, a per-micro-batch list for a list
             of them.
         """
-        if not isinstance(hidden_states, list):
-            assert isinstance(position_embeddings, tuple) and len(position_embeddings) == 2
-            assert isinstance(seq_ctx, SequenceContext)
-            return {
-                "hidden_states": self._forward(
+        with profile_range(2, layer_profile_name(self.layer_idx)):
+            hidden_states = profile_bw_close(hidden_states)
+            if not isinstance(hidden_states, list):
+                assert isinstance(position_embeddings, tuple) and len(position_embeddings) == 2
+                assert isinstance(seq_ctx, SequenceContext)
+                hidden_states = self._forward(
                     hidden_states=hidden_states,
                     position_embeddings=position_embeddings,
                     seq_ctx=seq_ctx,
                 )
-            }
+                return {"hidden_states": profile_bw_open(hidden_states, f"layer{self.layer_idx + 1}")}
 
-        assert isinstance(position_embeddings, list) and len(position_embeddings) == len(hidden_states)
-        assert isinstance(seq_ctx, list) and len(seq_ctx) == len(hidden_states)
-        assert all(hidden.shape == hidden_states[0].shape for hidden in hidden_states)
-        return {
-            "hidden_states": [
+            assert isinstance(position_embeddings, list) and len(position_embeddings) == len(hidden_states)
+            assert isinstance(seq_ctx, list) and len(seq_ctx) == len(hidden_states)
+            assert all(hidden.shape == hidden_states[0].shape for hidden in hidden_states)
+            hidden_states = [
                 self._forward(
                     hidden_states=hidden,
                     position_embeddings=position_embedding,
@@ -143,7 +145,7 @@ class DenseDecoderLayer(nn.Module):
                 )
                 for hidden, position_embedding, context in zip(hidden_states, position_embeddings, seq_ctx)
             ]
-        }
+            return {"hidden_states": profile_bw_open(hidden_states, f"layer{self.layer_idx + 1}")}
 
     def _forward(
         self,
@@ -155,20 +157,20 @@ class DenseDecoderLayer(nn.Module):
 
         hidden_states = self.input_layernorm(hidden_states)
 
-        # Self Attention
-        attn_outputs: AttnOutputs = self.self_attn(
-            hidden_states=hidden_states,
-            position_embeddings=position_embeddings,
-            seq_ctx=seq_ctx,
-        )
-        hidden_states = attn_outputs["projected_output"]
-        hidden_states = residual + hidden_states
+        with profile_range(3, "attn"):
+            attn_outputs: AttnOutputs = self.self_attn(
+                hidden_states=hidden_states,
+                position_embeddings=position_embeddings,
+                seq_ctx=seq_ctx,
+            )
+            hidden_states = attn_outputs["projected_output"]
+            hidden_states = residual + hidden_states
 
-        # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        with profile_range(3, "mlp"):
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = residual + hidden_states
 
         return hidden_states
 

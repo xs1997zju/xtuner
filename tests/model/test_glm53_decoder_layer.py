@@ -273,8 +273,13 @@ class TestGlm53DecoderLayerCompile:
         torch._dynamo.mark_dynamic(seq_ctx.cu_seq_lens_q, 0)
         torch._dynamo.mark_dynamic(seq_ctx.cu_seq_lens_k, 0)
 
-        compiled = torch.compile(Glm53DenseDecoderLayer._forward, fullgraph=False)
-        out = compiled(layer, streams, position_embeddings=(None, None), seq_ctx=seq_ctx)
+        # Match the production compile targets: the L3 wrapper stays eager.
+        layer._attn_forward = torch.compile(layer._attn_forward, fullgraph=False)
+        layer._ffn_forward = torch.compile(layer._ffn_forward, fullgraph=False)
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profiler:
+            out = layer(hidden_states=streams, position_embeddings=(None, None), seq_ctx=seq_ctx)["hidden_states"]
 
         assert out.shape == streams.shape
         assert torch.isfinite(out).all()
+        names = {event.name for event in profiler.events()}
+        assert {"xtuner.L2.layer1.forward", "xtuner.L3.attn", "xtuner.L3.mlp"} <= names

@@ -41,6 +41,7 @@ from xtuner.v1.utils import (
     get_logger,
     log_rank0,
 )
+from xtuner.v1.utils.profile import profile_embedding
 
 
 DEVICE = get_device()
@@ -59,7 +60,7 @@ class Dense(BaseModel):
     def __init__(self, config: TransformerConfig):
         super().__init__(config)
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, type=config.rms_norm_type)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, type=config.rms_norm_type, l2_name="norm")
         self.lm_head = LMHead(config.hidden_size, config.vocab_size, bias=False)
         self.layers = self.build_layers(config)
         self.rotary_emb = self.build_rotary_embedding(config)
@@ -83,8 +84,9 @@ class Dense(BaseModel):
         position_ids = seq_ctx.position_ids
 
         if input_ids is not None:
-            hidden_states = self.embed_tokens(input_ids)
+            hidden_states = profile_embedding(self.embed_tokens, input_ids)
         else:
+            assert seq_ctx.inputs_embeds is not None, "inputs_embeds should not be None when input_ids is None"
             hidden_states = seq_ctx.inputs_embeds
 
         # create position embeddings to be shared across the decoder layers

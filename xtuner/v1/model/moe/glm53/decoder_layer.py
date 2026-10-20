@@ -35,6 +35,7 @@ from xtuner.v1.module.decoder_layer.moe_decoder_layer import (
 from xtuner.v1.utils import ForwardState
 from xtuner.v1.utils.dtensor import materialize_full
 from xtuner.v1.utils.init_weight import init_params
+from xtuner.v1.utils.profile import profile_range
 
 
 class _MHCResidual(NamedTuple):
@@ -123,9 +124,21 @@ class Glm53DenseDecoderLayer(DenseDecoderLayer):
     ) -> torch.Tensor:
         if not self.use_mhc:
             return super()._forward(hidden_states, position_embeddings=position_embeddings, seq_ctx=seq_ctx)
-        assert self.mhc_cfg is not None
 
-        # ---- attention site: hidden_states is [B, S, hc_mult, hidden_size]
+        # The two bodies remain compiled; the ranges stay visible in the trace.
+        with profile_range(3, "attn"):
+            hidden_states = self._attn_forward(hidden_states, position_embeddings, seq_ctx)
+        with profile_range(3, "mlp"):
+            return self._ffn_forward(hidden_states)
+
+    def _attn_forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        seq_ctx: SequenceContext,
+    ) -> torch.Tensor:
+        assert self.mhc_cfg is not None
+        # hidden_states is [B, S, hc_mult, hidden_size].
         # HF uses the text RMS epsilon when normalizing flattened mHC streams.
         fn, scale, base = _unshard_hc_site(self, "attn")
         residual = hidden_states
@@ -144,8 +157,10 @@ class Glm53DenseDecoderLayer(DenseDecoderLayer):
             hidden_states=self.input_layernorm(x), position_embeddings=position_embeddings, seq_ctx=seq_ctx
         )
         hidden_states = hc_post(attn_outputs["projected_output"], residual, post, comb)
+        return hidden_states
 
-        # ---- ffn site
+    def _ffn_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        assert self.mhc_cfg is not None
         fn, scale, base = _unshard_hc_site(self, "ffn")
         residual = hidden_states
         x, post, comb = hc_pre(
@@ -202,66 +217,68 @@ class Glm53MoEDecoderLayer(MoEDecoderLayer):
         # `_post_moe_forward`, never inspecting it, so this is a safe covariant extension of
         # the informal "opaque payload" contract, not a real Liskov violation.
         if not self.use_mhc:
-            return super()._pre_moe_forward(
-                hidden_states,
-                seq_ctx,
-                position_embeddings,
-                state,
-                past_key_values=past_key_values,
-                attention_kwargs=attention_kwargs,
-            )
+            with profile_range(3, "attn_gate"):
+                return super()._pre_moe_forward(
+                    hidden_states,
+                    seq_ctx,
+                    position_embeddings,
+                    state,
+                    past_key_values=past_key_values,
+                    attention_kwargs=attention_kwargs,
+                )
         assert self.mhc_cfg is not None
         assert state == ForwardState.TRAINING, "mHC-wrapped GLM-5.3-Flash decoder layers only support SFT training"
 
-        # ---- attention site: hidden_states is [B, S, hc_mult, hidden_size]
-        fn, scale, base = _unshard_hc_site(self, "attn")
-        attn_residual = hidden_states
-        x, post, comb = hc_pre(
-            hidden_states,
-            fn,
-            scale,
-            base,
-            self.mhc_cfg.hc_mult,
-            self.mhc_cfg.hc_sinkhorn_iters,
-            self.mhc_cfg.hc_eps,
-            norm_eps=self.input_layernorm.variance_epsilon,
-            projection_block_size=self.mhc_cfg.projection_block_size,
-        )
-        attention_forward = cast(Callable[..., AttnOutputs], self.self_attn)
-        attn_outputs = attention_forward(
-            hidden_states=self.input_layernorm(x),
-            position_embeddings=position_embeddings,
-            seq_ctx=seq_ctx,
-            **(attention_kwargs or {}),
-        )
-        hidden_states = hc_post(attn_outputs["projected_output"], attn_residual, post, comb)
-
-        # ---- ffn site
-        fn, scale, base = _unshard_hc_site(self, "ffn")
-        ffn_residual = hidden_states
-        x, post, comb = hc_pre(
-            hidden_states,
-            fn,
-            scale,
-            base,
-            self.mhc_cfg.hc_mult,
-            self.mhc_cfg.hc_sinkhorn_iters,
-            self.mhc_cfg.hc_eps,
-            norm_eps=self.post_attention_layernorm.variance_epsilon,
-            projection_block_size=self.mhc_cfg.projection_block_size,
-        )
-        hidden_states = self.post_attention_layernorm(x)
-
-        if seq_ctx.rollout_routed_experts is not None and self.layer_idx < seq_ctx.rollout_routed_experts.shape[1]:
-            rollout_routed_experts = seq_ctx.rollout_routed_experts[:, self.layer_idx, :]
-            rollout_routed_experts = _prepare_rollout_routed_experts_for_router(
-                rollout_routed_experts,
+        # The EP path keeps this method eager, so these ranges expose mHC work too.
+        with profile_range(3, "attn"):
+            fn, scale, base = _unshard_hc_site(self, "attn")
+            attn_residual = hidden_states
+            x, post, comb = hc_pre(
                 hidden_states,
-                offload_rollout_routed_experts=seq_ctx.offload_rollout_routed_experts,
+                fn,
+                scale,
+                base,
+                self.mhc_cfg.hc_mult,
+                self.mhc_cfg.hc_sinkhorn_iters,
+                self.mhc_cfg.hc_eps,
+                norm_eps=self.input_layernorm.variance_epsilon,
+                projection_block_size=self.mhc_cfg.projection_block_size,
             )
-        else:
-            rollout_routed_experts = None
-        router_results: RouterResults = self.gate(hidden_states, rollout_routed_experts)
+            attention_forward = cast(Callable[..., AttnOutputs], self.self_attn)
+            attn_outputs = attention_forward(
+                hidden_states=self.input_layernorm(x),
+                position_embeddings=position_embeddings,
+                seq_ctx=seq_ctx,
+                **(attention_kwargs or {}),
+            )
+            hidden_states = hc_post(attn_outputs["projected_output"], attn_residual, post, comb)
+
+        with profile_range(3, "gate"):
+            fn, scale, base = _unshard_hc_site(self, "ffn")
+            ffn_residual = hidden_states
+            x, post, comb = hc_pre(
+                hidden_states,
+                fn,
+                scale,
+                base,
+                self.mhc_cfg.hc_mult,
+                self.mhc_cfg.hc_sinkhorn_iters,
+                self.mhc_cfg.hc_eps,
+                norm_eps=self.post_attention_layernorm.variance_epsilon,
+                projection_block_size=self.mhc_cfg.projection_block_size,
+            )
+            hidden_states = self.post_attention_layernorm(x)
+
+            if seq_ctx.rollout_routed_experts is not None and self.layer_idx < seq_ctx.rollout_routed_experts.shape[1]:
+                rollout_routed_experts = seq_ctx.rollout_routed_experts[:, self.layer_idx, :]
+                rollout_routed_experts = _prepare_rollout_routed_experts_for_router(
+                    rollout_routed_experts,
+                    hidden_states,
+                    offload_rollout_routed_experts=seq_ctx.offload_rollout_routed_experts,
+                )
+            else:
+                rollout_routed_experts = None
+            router_results: RouterResults = self.gate(hidden_states, rollout_routed_experts)
 
         return _MHCResidual(ffn_residual, post, comb), hidden_states, router_results, attn_outputs
 
@@ -277,8 +294,9 @@ class Glm53MoEDecoderLayer(MoEDecoderLayer):
             return super()._post_moe_forward(combined_hidden_states, residual, shared_experts_out)
         assert isinstance(residual, _MHCResidual)
 
-        if self.n_shared_experts > 0:
-            assert shared_experts_out is not None
-            combined_hidden_states = combined_hidden_states + shared_experts_out
-        combined_hidden_states = combined_hidden_states * self.hidden_factor
-        return hc_post(combined_hidden_states, residual.streams, residual.post, residual.comb)
+        with profile_range(3, "mlp"):
+            if self.n_shared_experts > 0:
+                assert shared_experts_out is not None
+                combined_hidden_states = combined_hidden_states + shared_experts_out
+            combined_hidden_states = combined_hidden_states * self.hidden_factor
+            return hc_post(combined_hidden_states, residual.streams, residual.post, residual.comb)

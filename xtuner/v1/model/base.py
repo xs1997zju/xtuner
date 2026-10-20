@@ -46,8 +46,15 @@ from xtuner.v1.float8.fsdp_utils import (
 from xtuner.v1.loss import BaseLossConfig, BaseLossContext, CELossConfig
 from xtuner.v1.module.attention import GatedDeltaNetConfig, KDAConfig, MHAConfig, MLAConfig
 from xtuner.v1.module.rope import RopeParametersConfig, RopeScalingConfig
-from xtuner.v1.utils import get_device, get_logger, get_torch_device_module, log_rank0, profile_time_and_memory
-from xtuner.v1.utils.compile import MaybeCompile, is_compiled_function, maybe_compile
+from xtuner.v1.utils import (
+    get_device,
+    get_logger,
+    get_torch_device_module,
+    log_rank0,
+    profile_time_and_memory,
+    profiled_item,
+)
+from xtuner.v1.utils.compile import MaybeCompile, is_compiled_function, maybe_compile, wrap_with_profile_range
 from xtuner.v1.utils.load_spec import (
     HFSavePlan,
     LoadSpec,
@@ -1276,7 +1283,7 @@ class BaseModel(nn.Module):
             for name in output_copy.model_fields:
                 obj = getattr(output_copy, name)
                 if "loss" in name and isinstance(obj, torch.Tensor):
-                    loss_item = obj.item()
+                    loss_item = profiled_item(obj, "output_loss")
                     local_total_loss += loss_item
                     reduced_name = f"reduced_{name}"
 
@@ -2076,7 +2083,9 @@ class BaseModel(nn.Module):
                 cls = getattr(import_module(module_name), class_name)
 
                 if not is_compiled_function(compiled_function):
-                    setattr(cls, method_name, torch.compile(compiled_function, **compile_options))
+                    compiled = torch.compile(compiled_function, **compile_options)
+                    qualname = get_function_full_qualname(compiled_function)
+                    setattr(cls, method_name, wrap_with_profile_range(compiled, qualname))
 
         full_name = get_function_full_qualname(compiled_function)  # type: ignore[arg-type]
         logger.debug(f"Enabling torch.compile for function {full_name} with options: {compile_options}")

@@ -2,6 +2,8 @@ import torch
 from torch.distributed._functional_collectives import all_to_all_single_autograd as _all_to_all_single_autograd
 from torch.distributed.device_mesh import DeviceMesh
 
+from xtuner.v1.utils.profile import profile_range
+
 
 def ulysses_all_to_all(
     input: torch.Tensor,
@@ -38,12 +40,13 @@ def ulysses_all_to_all(
     # (a bug of torch compile)
     input = input.movedim(scatter_dim, 0)
 
-    output = _all_to_all_single_autograd(
-        input,
-        group=mesh.get_group(),
-        input_split_sizes=input_split_sizes,
-        output_split_sizes=output_split_sizes,
-    )
+    with profile_range(3, "sp_all_to_all"):
+        output = _all_to_all_single_autograd(
+            input,
+            group=mesh.get_group(),
+            input_split_sizes=input_split_sizes,
+            output_split_sizes=output_split_sizes,
+        )
     output = output.movedim(0, scatter_dim)
 
     output_list = torch.tensor_split(output, world_size, scatter_dim)

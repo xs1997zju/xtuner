@@ -10,6 +10,7 @@ from xtuner.v1.module.decoder_layer.moe_decoder_layer import (
 )
 from xtuner.v1.module.mtp import MTPBlock, MTPLayer
 from xtuner.v1.module.mtp.mtp_block import MTPInternalOutput
+from xtuner.v1.utils.profile import mtp_profile_name, profile_bw_close, profile_bw_open, profile_range
 
 from .decoder_layer import (
     GLM52MoEDecoderLayerMicroBatchOutput,
@@ -30,59 +31,67 @@ class GLM52MTPLayer(MTPLayer):
         seq_ctx: SequenceContext | list[SequenceContext],
         dsa_topk_ids: torch.Tensor | list[torch.Tensor] | None = None,
     ) -> GLM52MoEDecoderLayerOutput | GLM52MoEDecoderLayerMicroBatchOutput:
-        if not isinstance(hidden_states, list):
-            assert isinstance(future_embeddings, torch.Tensor)
-            assert isinstance(position_embeddings, tuple) and len(position_embeddings) == 2
-            assert isinstance(seq_ctx, SequenceContext)
-            assert dsa_topk_ids is None or isinstance(dsa_topk_ids, torch.Tensor)
-            projected = self._preprocess(hidden_states=hidden_states, future_embeddings=future_embeddings)
-            layer_results = cast(
-                GLM52MoEDecoderLayerOutput,
+        with profile_range(2, mtp_profile_name(self.mtp_idx)):
+            hidden_states = profile_bw_close(hidden_states)
+            future_embeddings = profile_bw_close(future_embeddings)
+            if not isinstance(hidden_states, list):
+                assert isinstance(future_embeddings, torch.Tensor)
+                assert isinstance(position_embeddings, tuple) and len(position_embeddings) == 2
+                assert isinstance(seq_ctx, SequenceContext)
+                assert dsa_topk_ids is None or isinstance(dsa_topk_ids, torch.Tensor)
+                projected = self._preprocess(hidden_states=hidden_states, future_embeddings=future_embeddings)
+                layer_results = cast(
+                    GLM52MoEDecoderLayerOutput,
+                    self.decoder_layer(
+                        projected,
+                        position_embeddings=position_embeddings,
+                        seq_ctx=seq_ctx,
+                        dsa_topk_ids=dsa_topk_ids,
+                    ),
+                )
+                return {
+                    "hidden_states": profile_bw_open(
+                        self.final_layernorm(layer_results["hidden_states"]), f"mtp{self.mtp_idx + 1}"
+                    ),
+                    "router_logits": layer_results["router_logits"],
+                    "router_weights": layer_results["router_weights"],
+                    "router_topk_ids": layer_results["router_topk_ids"],
+                    "dsa_topk_ids": layer_results["dsa_topk_ids"],
+                }
+
+            n = len(hidden_states)
+            assert isinstance(future_embeddings, list) and len(future_embeddings) == n
+            assert isinstance(position_embeddings, list) and len(position_embeddings) == n
+            assert isinstance(seq_ctx, list) and len(seq_ctx) == n
+            if dsa_topk_ids is None:
+                decoder_topk_ids = None
+            else:
+                assert isinstance(dsa_topk_ids, list) and len(dsa_topk_ids) == n
+                decoder_topk_ids = dsa_topk_ids
+
+            projected_list = [
+                self._preprocess(hidden_states=hidden, future_embeddings=future)
+                for hidden, future in zip(hidden_states, future_embeddings)
+            ]
+            micro_batch_results = cast(
+                GLM52MoEDecoderLayerMicroBatchOutput,
                 self.decoder_layer(
-                    projected,
+                    projected_list,
                     position_embeddings=position_embeddings,
                     seq_ctx=seq_ctx,
-                    dsa_topk_ids=dsa_topk_ids,
+                    dsa_topk_ids=decoder_topk_ids,
                 ),
             )
             return {
-                "hidden_states": self.final_layernorm(layer_results["hidden_states"]),
-                "router_logits": layer_results["router_logits"],
-                "router_weights": layer_results["router_weights"],
-                "router_topk_ids": layer_results["router_topk_ids"],
-                "dsa_topk_ids": layer_results["dsa_topk_ids"],
+                "hidden_states": profile_bw_open(
+                    [self.final_layernorm(hidden) for hidden in micro_batch_results["hidden_states"]],
+                    f"mtp{self.mtp_idx + 1}",
+                ),
+                "router_logits": micro_batch_results["router_logits"],
+                "router_weights": micro_batch_results["router_weights"],
+                "router_topk_ids": micro_batch_results["router_topk_ids"],
+                "dsa_topk_ids": micro_batch_results["dsa_topk_ids"],
             }
-
-        n = len(hidden_states)
-        assert isinstance(future_embeddings, list) and len(future_embeddings) == n
-        assert isinstance(position_embeddings, list) and len(position_embeddings) == n
-        assert isinstance(seq_ctx, list) and len(seq_ctx) == n
-        if dsa_topk_ids is None:
-            decoder_topk_ids = None
-        else:
-            assert isinstance(dsa_topk_ids, list) and len(dsa_topk_ids) == n
-            decoder_topk_ids = dsa_topk_ids
-
-        projected_list = [
-            self._preprocess(hidden_states=hidden, future_embeddings=future)
-            for hidden, future in zip(hidden_states, future_embeddings)
-        ]
-        micro_batch_results = cast(
-            GLM52MoEDecoderLayerMicroBatchOutput,
-            self.decoder_layer(
-                projected_list,
-                position_embeddings=position_embeddings,
-                seq_ctx=seq_ctx,
-                dsa_topk_ids=decoder_topk_ids,
-            ),
-        )
-        return {
-            "hidden_states": [self.final_layernorm(hidden) for hidden in micro_batch_results["hidden_states"]],
-            "router_logits": micro_batch_results["router_logits"],
-            "router_weights": micro_batch_results["router_weights"],
-            "router_topk_ids": micro_batch_results["router_topk_ids"],
-            "dsa_topk_ids": micro_batch_results["dsa_topk_ids"],
-        }
 
 
 class GLM52MTPBlock(MTPBlock):

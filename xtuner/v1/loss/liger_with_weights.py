@@ -4,6 +4,8 @@ from typing import Optional
 import torch
 import triton
 
+from xtuner.v1.utils.profile import profiled_item
+
 
 try:
     from liger_kernel.ops.cross_entropy import liger_cross_entropy_kernel
@@ -60,9 +62,8 @@ def fused_linear_cross_entropy_forward(
     loss_1d = torch.zeros(BT, dtype=torch.float32, device=device)
     z_loss_1d = torch.zeros(BT, dtype=_input.dtype, device=_input.device) if return_z_loss else None
 
-    # TODO: evaluate how CUDA synchronization caused by .item() affects the speed
     target_mask = target != ignore_index
-    total_n_non_ignore = target_mask.sum().item()
+    total_n_non_ignore = profiled_item(target_mask.sum(), "liger_n_non_ignore")
     total_sum_non_ignore_ce_weight = total_n_non_ignore
     ce_weight_sum = 0.0
     if ce_weight is not None:
@@ -70,10 +71,11 @@ def fused_linear_cross_entropy_forward(
         assert torch.is_floating_point(ce_weight), (
             f"If given, weight has to be a Tensor of floating point dtype. Got: {ce_weight.dtype}"
         )
-        total_sum_non_ignore_ce_weight = (
-            torch.gather(ce_weight, dim=0, index=target.masked_select(target_mask)).sum().item()
+        total_sum_non_ignore_ce_weight = profiled_item(
+            torch.gather(ce_weight, dim=0, index=target.masked_select(target_mask)).sum(),
+            "liger_ce_weight",
         )
-        ce_weight_sum = ce_weight.sum().item()
+        ce_weight_sum = profiled_item(ce_weight.sum(), "liger_ce_weight_sum")
         if ce_weight.stride(-1) != 1:
             ce_weight = ce_weight.contiguous()
 

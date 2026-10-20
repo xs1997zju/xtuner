@@ -15,6 +15,7 @@ from xtuner.v1.module.decoder_layer.moe_decoder_layer import (
     MoEDecoderLayerMicroBatchOutput,
     MoEDecoderLayerOutput,
 )
+from xtuner.v1.utils.profile import layer_profile_name, profile_bw_close, profile_bw_open, profile_range
 
 from .dsa_mla import DSAMultiLatentAttention, GLM52AttnOutputs
 
@@ -43,42 +44,48 @@ class GLM52DenseDecoderLayer(DenseDecoderLayer):
         seq_ctx: SequenceContext | list[SequenceContext],
         dsa_topk_ids: torch.Tensor | list[torch.Tensor] | None = None,
     ) -> GLM52DenseDecoderLayerOutput | GLM52DenseDecoderLayerMicroBatchOutput:
-        if not isinstance(hidden_states, list):
-            assert isinstance(position_embeddings, tuple) and len(position_embeddings) == 2
-            assert isinstance(seq_ctx, SequenceContext)
-            assert dsa_topk_ids is None or isinstance(dsa_topk_ids, torch.Tensor)
-            return self._glm52_forward(
-                hidden_states=hidden_states,
-                position_embeddings=position_embeddings,
-                seq_ctx=seq_ctx,
-                dsa_topk_ids=dsa_topk_ids,
-            )
+        with profile_range(2, layer_profile_name(self.layer_idx)):
+            hidden_states = profile_bw_close(hidden_states)
+            if not isinstance(hidden_states, list):
+                assert isinstance(position_embeddings, tuple) and len(position_embeddings) == 2
+                assert isinstance(seq_ctx, SequenceContext)
+                assert dsa_topk_ids is None or isinstance(dsa_topk_ids, torch.Tensor)
+                result = self._glm52_forward(
+                    hidden_states=hidden_states,
+                    position_embeddings=position_embeddings,
+                    seq_ctx=seq_ctx,
+                    dsa_topk_ids=dsa_topk_ids,
+                )
+                result["hidden_states"] = profile_bw_open(result["hidden_states"], f"layer{self.layer_idx + 1}")
+                return result
 
-        n = len(hidden_states)
-        assert isinstance(position_embeddings, list) and len(position_embeddings) == n
-        assert isinstance(seq_ctx, list) and len(seq_ctx) == n
-        assert all(hidden.shape == hidden_states[0].shape for hidden in hidden_states)
-        if dsa_topk_ids is None:
-            dsa_topk_ids_list: list[torch.Tensor | None] = [None] * n
-        else:
-            assert isinstance(dsa_topk_ids, list) and len(dsa_topk_ids) == n
-            dsa_topk_ids_list = list(dsa_topk_ids)
+            n = len(hidden_states)
+            assert isinstance(position_embeddings, list) and len(position_embeddings) == n
+            assert isinstance(seq_ctx, list) and len(seq_ctx) == n
+            assert all(hidden.shape == hidden_states[0].shape for hidden in hidden_states)
+            if dsa_topk_ids is None:
+                dsa_topk_ids_list: list[torch.Tensor | None] = [None] * n
+            else:
+                assert isinstance(dsa_topk_ids, list) and len(dsa_topk_ids) == n
+                dsa_topk_ids_list = list(dsa_topk_ids)
 
-        layer_results = [
-            self._glm52_forward(
-                hidden_states=hidden,
-                position_embeddings=position_embedding,
-                seq_ctx=context,
-                dsa_topk_ids=topk_ids,
-            )
-            for hidden, topk_ids, position_embedding, context in zip(
-                hidden_states, dsa_topk_ids_list, position_embeddings, seq_ctx
-            )
-        ]
-        return {
-            "hidden_states": [result["hidden_states"] for result in layer_results],
-            "dsa_topk_ids": [result["dsa_topk_ids"] for result in layer_results],
-        }
+            layer_results = [
+                self._glm52_forward(
+                    hidden_states=hidden,
+                    position_embeddings=position_embedding,
+                    seq_ctx=context,
+                    dsa_topk_ids=topk_ids,
+                )
+                for hidden, topk_ids, position_embedding, context in zip(
+                    hidden_states, dsa_topk_ids_list, position_embeddings, seq_ctx
+                )
+            ]
+            return {
+                "hidden_states": profile_bw_open(
+                    [result["hidden_states"] for result in layer_results], f"layer{self.layer_idx + 1}"
+                ),
+                "dsa_topk_ids": [result["dsa_topk_ids"] for result in layer_results],
+            }
 
     def _glm52_forward(
         self,
@@ -91,19 +98,21 @@ class GLM52DenseDecoderLayer(DenseDecoderLayer):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        attention = cast(DSAMultiLatentAttention, self.self_attn)
-        attn_outputs = attention(
-            hidden_states=hidden_states,
-            position_embeddings=position_embeddings,
-            seq_ctx=seq_ctx,
-            dsa_topk_ids=dsa_topk_ids,
-        )
-        hidden_states = residual + attn_outputs["projected_output"]
+        with profile_range(3, "attn"):
+            attention = cast(DSAMultiLatentAttention, self.self_attn)
+            attn_outputs = attention(
+                hidden_states=hidden_states,
+                position_embeddings=position_embeddings,
+                seq_ctx=seq_ctx,
+                dsa_topk_ids=dsa_topk_ids,
+            )
+            hidden_states = residual + attn_outputs["projected_output"]
 
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        with profile_range(3, "mlp"):
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = residual + hidden_states
 
         return {
             "hidden_states": hidden_states,
@@ -135,38 +144,44 @@ class GLM52MoEDecoderLayer(MoEDecoderLayer):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | list[tuple[torch.Tensor, torch.Tensor]],
         dsa_topk_ids: torch.Tensor | list[torch.Tensor] | None = None,
     ) -> GLM52MoEDecoderLayerOutput | GLM52MoEDecoderLayerMicroBatchOutput:
-        if not isinstance(hidden_states, list):
-            assert isinstance(seq_ctx, SequenceContext)
-            assert isinstance(position_embeddings, tuple) and len(position_embeddings) == 2
-            assert dsa_topk_ids is None or isinstance(dsa_topk_ids, torch.Tensor)
-            return cast(
-                GLM52MoEDecoderLayerOutput,
-                self._forward(
-                    hidden_states=hidden_states,
-                    seq_ctx=seq_ctx,
-                    position_embeddings=position_embeddings,
-                    attention_kwargs={"dsa_topk_ids": dsa_topk_ids},
+        with profile_range(2, layer_profile_name(self.layer_idx)):
+            hidden_states = profile_bw_close(hidden_states)
+            if not isinstance(hidden_states, list):
+                assert isinstance(seq_ctx, SequenceContext)
+                assert isinstance(position_embeddings, tuple) and len(position_embeddings) == 2
+                assert dsa_topk_ids is None or isinstance(dsa_topk_ids, torch.Tensor)
+                single = cast(
+                    GLM52MoEDecoderLayerOutput,
+                    self._forward(
+                        hidden_states=hidden_states,
+                        seq_ctx=seq_ctx,
+                        position_embeddings=position_embeddings,
+                        attention_kwargs={"dsa_topk_ids": dsa_topk_ids},
+                    ),
+                )
+                single["hidden_states"] = profile_bw_open(single["hidden_states"], f"layer{self.layer_idx + 1}")
+                return single
+
+            n = len(hidden_states)
+            assert isinstance(seq_ctx, list) and len(seq_ctx) == n
+            assert isinstance(position_embeddings, list) and len(position_embeddings) == n
+            if dsa_topk_ids is None:
+                dsa_topk_ids_list: list[torch.Tensor | None] = [None] * n
+            else:
+                assert isinstance(dsa_topk_ids, list) and len(dsa_topk_ids) == n
+                dsa_topk_ids_list = list(dsa_topk_ids)
+
+            batch = cast(
+                GLM52MoEDecoderLayerMicroBatchOutput,
+                self._micro_batch_forward(
+                    hidden_states_list=hidden_states,
+                    seq_ctx_list=seq_ctx,
+                    position_embeddings_list=position_embeddings,
+                    attention_kwargs_list=[{"dsa_topk_ids": topk_ids} for topk_ids in dsa_topk_ids_list],
                 ),
             )
-
-        n = len(hidden_states)
-        assert isinstance(seq_ctx, list) and len(seq_ctx) == n
-        assert isinstance(position_embeddings, list) and len(position_embeddings) == n
-        if dsa_topk_ids is None:
-            dsa_topk_ids_list: list[torch.Tensor | None] = [None] * n
-        else:
-            assert isinstance(dsa_topk_ids, list) and len(dsa_topk_ids) == n
-            dsa_topk_ids_list = list(dsa_topk_ids)
-
-        return cast(
-            GLM52MoEDecoderLayerMicroBatchOutput,
-            self._micro_batch_forward(
-                hidden_states_list=hidden_states,
-                seq_ctx_list=seq_ctx,
-                position_embeddings_list=position_embeddings,
-                attention_kwargs_list=[{"dsa_topk_ids": topk_ids} for topk_ids in dsa_topk_ids_list],
-            ),
-        )
+            batch["hidden_states"] = profile_bw_open(batch["hidden_states"], f"layer{self.layer_idx + 1}")
+            return batch
 
     @override
     def _build_output(

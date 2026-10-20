@@ -1,0 +1,63 @@
+# Rules for profile/mem_snapshot.py and profile/mem_ranks.py.
+#
+# Input: the CUDA caching-allocator snapshot written by PROFILE_MEMORY=1 (rank*_memory_snapshot.pickle): every
+# allocator event of one training step with its Python stack, the segment table at the end of the step, and the
+# record_function annotations (xtuner.L1.* / xtuner.L2.* ranges) that were open meanwhile.
+# Patterns are Python regexes applied with re.search; within a list the first match wins.
+
+[device]
+# Physical memory of one GPU in GiB (H200: 143771 MiB).  The allocator can map a few GiB less: the CUDA context,
+# NCCL and DeepEP keep buffers outside it.  Used for the headroom column and the device line of the chart.
+total_gib = 140.4
+
+[range]
+# Training phases, from the snapshot annotations.  The label may use regex groups {1}, {2}, ...
+# L1: training-loop phases on the main thread.  L2: layers and modules on the thread that runs them.
+l1 = [
+  { match = '^xtuner\.L1\.(.+)$', label = "{1}" },
+  { match = '^Optimizer\.step#', label = "optimizer" },
+  { match = '^Optimizer\.zero_grad#', label = "zero_grad" },
+]
+l2 = [
+  { match = '^xtuner\.L2\.(.+)$', label = "{1}" },
+]
+
+[site]
+# The "site" of an allocation is its innermost stack frame that does not match `skip` (matched as path:function:
+# PyTorch internals, Inductor's generated code, and generic helpers such as FSDP's `allocate`, which serves both the
+# all-gather output and the reduce-scatter input); the "caller" is the innermost frame inside the project.  Both are
+# shown as file:line:function.  Allocations made by C++ autograd have no Python frame at all.
+skip = '/torch/(?!distributed/fsdp)|torchinductor|<frozen|/triton/|_fsdp_collectives\.py:allocate$'
+caller = '/xtuner/'
+
+[pool]
+# The caching allocator keeps one pool per CUDA stream.  A side stream is named after the site that allocates the most
+# bytes on it (matched as "<site>\n<caller>", each path:function); the default stream is "compute".
+rules = [
+  { match = 'deep_ep/', pool = "deepep comm" },
+  { match = 'foreach_reduce|reduce_scatter|_to_dtype_if_needed', pool = "fsdp reduce-scatter" },
+  { match = 'foreach_all_gather|_fsdp_param\.py', pool = "fsdp all-gather" },
+  { match = 'offload', pool = "offload" },
+]
+
+[category]
+# What an allocation is, matched against "<site>\n<caller>\npool:<pool>" (site and caller as path:function).  Only
+# these two frames are used: outer frames such as the model's forward appear in almost every stack and would swallow
+# everything.  Allocations that match no rule are named after the L2 phase they were made in, "activation (forward /
+# recompute / backward)", and outside any L2 range "other (<L1 phase>)".  Blocks allocated before the profiled step
+# are "before step": parameter shards, optimizer states and whatever else lives across steps.
+rules = [
+  { match = 'deep_ep/', category = "deepep buffer" },
+  { match = '_fsdp_common\.py:_to_dtype_if_needed', category = "grad shard" },
+  { match = '_fsdp_collectives\.py:foreach_reduce|pool:fsdp reduce-scatter', category = "fsdp reduce-scatter" },
+  { match = '_fsdp_param\.py:alloc_storage|_fsdp_collectives\.py:foreach_all_gather', category = "fsdp unsharded param" },
+  { match = 'grouped_gemm|/ops/moe/|float8_gmm|permute', category = "moe routed tokens" },
+  { match = 'activation_offload', category = "activation offload" },
+  { match = '/optim/|zero_grad', category = "optimizer" },
+]
+
+[report]
+top = 15                  # rows in the site / layer tables
+big_request_gib = 1.0     # allocations at least this large are listed as "large requests"
+chart_points = 60         # samples in the Mermaid memory curve
+min_gib = 0.05            # rows below this are folded into "other"

@@ -47,7 +47,9 @@ from xtuner.v1.utils import (
     get_logger,
     get_torch_device_module,
     log_rank0,
+    profile_range,
     profile_time_and_memory,
+    profiled_item,
 )
 from xtuner.v1.utils.activation_offload import OffloadManager
 from xtuner.v1.utils.grad_norm import cal_grad_norm
@@ -203,7 +205,8 @@ class TrainEngine:
         Args:
             data_batches (List[Dict]): The input data batches for the training step.
         """
-        self._maybe_precompute_float8_dynamic_scale_for_fsdp()
+        with profile_range(1, "fp8_scale"):
+            self._maybe_precompute_float8_dynamic_scale_for_fsdp()
 
         intra_layer_micro_batch = self.intra_layer_micro_batch
         assert len(data_batches) % intra_layer_micro_batch == 0, (
@@ -218,7 +221,10 @@ class TrainEngine:
         micro_batch_iter = 0
         micro_batch_results = []
 
-        data_batch_info = self.model.pre_micro_batch_forward(data_batches)
+        # Keep phase ranges outside the compiled callables so they annotate the
+        # CUDA work launched by both the forward and autograd engine.
+        with profile_range(1, "pre_micro"):
+            data_batch_info = self.model.pre_micro_batch_forward(data_batches)
         total_loss = torch.tensor(0.0, device=DEVICE)
 
         # Saved-tensor offload is scoped to one complete optimizer step. All
@@ -229,27 +235,30 @@ class TrainEngine:
         # when backward raises (OOM retry, NaN abort, ...).
         try:
             for i in range(0, len(data_batches), intra_layer_micro_batch):
-                ProberList.set_micro_batch_iter(micro_batch_iter)
+                micro_batch_index = micro_batch_iter
+                ProberList.set_micro_batch_iter(micro_batch_index)
                 micro_batch_iter += 1
                 data_batch = data_batches[i : i + intra_layer_micro_batch]
                 seq_ctx_list = [i["seq_ctx"] for i in data_batch]
                 loss_ctx_list = [i["loss_ctx"] for i in data_batch]
 
-                if self.intra_layer_micro_batch == 1:
-                    output = self.model(seq_ctx=seq_ctx_list[0], loss_ctx=loss_ctx_list[0])
-                else:
-                    # For intra_layer_micro_batch > 1, we need to handle the data batches differently.
-                    # Here we assume that the model can handle a list of seq_ctx and loss_ctx.
-                    output = self.model(
-                        seq_ctx=seq_ctx_list,
-                        loss_ctx=loss_ctx_list,  # type: ignore[arg-type]
-                    )
+                with profile_range(1, f"forward.{micro_batch_index}"):
+                    if self.intra_layer_micro_batch == 1:
+                        output = self.model(seq_ctx=seq_ctx_list[0], loss_ctx=loss_ctx_list[0])
+                    else:
+                        # For intra_layer_micro_batch > 1, we need to handle the data batches differently.
+                        # Here we assume that the model can handle a list of seq_ctx and loss_ctx.
+                        output = self.model(
+                            seq_ctx=seq_ctx_list,
+                            loss_ctx=loss_ctx_list,  # type: ignore[arg-type]
+                        )
                 output.free_nongrad_feature()
 
                 micro_batch_results.append(output)
 
                 loss = self._get_total_loss(output)
-                loss.backward()
+                with profile_range(1, f"backward.{micro_batch_index}"):
+                    loss.backward()
                 # Logging must not retain checkpoint contexts from completed backwards.
                 # Detaching here leaves accumulated parameter gradients untouched.
                 loss = loss.detach()
@@ -260,10 +269,13 @@ class TrainEngine:
                 # call dump_forward_records after backward to record the recomputed activations
                 ProberList.after_micro_iter_forward()
 
-            batch_forward_info = self.model.post_micro_batch_forward(micro_batch_results)
+            with profile_range(1, "post_micro"):
+                batch_forward_info = self.model.post_micro_batch_forward(micro_batch_results)
         finally:
             OffloadManager().clear_step()
-        return TrainStepInfo(total_loss=total_loss.item(), **data_batch_info, **batch_forward_info)
+        return TrainStepInfo(
+            total_loss=profiled_item(total_loss, "step_loss"), **data_batch_info, **batch_forward_info
+        )
 
     def from_hf(self, hf_path: str | Path, strict: bool = False):
         self.model.from_hf(hf_path=hf_path, strict=strict)
@@ -273,31 +285,37 @@ class TrainEngine:
 
     @_no_grad
     def clip_grad_norm(self, do_clip: bool = True, dtype=torch.float32):
-        ProberList.before_clip_grad_norm(self.model)
-        self.model.scale_and_reduce_grad()
+        # Without this range the post-backward reduce/clip phase is invisible;
+        # its GPU work would otherwise be merged into unattributed intervals.
+        with profile_range(1, "clip"):
+            ProberList.before_clip_grad_norm(self.model)
+            self.model.scale_and_reduce_grad()
 
-        trainable_params = [p for _, p in self.model.trainable_parameters()]
-        all_grads = [p.grad for p in trainable_params if p.grad is not None]
-        total_grad_norm, grouped_all_grads = self.model.cal_grad_norm(all_grads, dtype=dtype)
+            trainable_params = [p for _, p in self.model.trainable_parameters()]
+            all_grads = [p.grad for p in trainable_params if p.grad is not None]
+            total_grad_norm, grouped_all_grads = self.model.cal_grad_norm(all_grads, dtype=dtype)
 
-        if do_clip:
-            clip_param_ids = {
-                id(p) for group in self.optimizer.param_groups if group.get("clip_grad", True) for p in group["params"]
-            }
-            clip_grads = [
-                cast(DTensor, p.grad) for p in trainable_params if id(p) in clip_param_ids and p.grad is not None
-            ]
-            clip_all_grads = len(clip_param_ids) == len(trainable_params) and clip_param_ids == {
-                id(p) for p in trainable_params
-            }
-            self._clip_gradients(
-                clip_grads,
-                max_norm=self.optim_cfg.max_grad_norm,
-                dtype=dtype,
-                precomputed_grad_info=(total_grad_norm, grouped_all_grads) if clip_all_grads else None,
-            )
-        ProberList.after_clip_grad_norm(self.model, total_grad_norm)
-        return total_grad_norm
+            if do_clip:
+                clip_param_ids = {
+                    id(p)
+                    for group in self.optimizer.param_groups
+                    if group.get("clip_grad", True)
+                    for p in group["params"]
+                }
+                clip_grads = [
+                    cast(DTensor, p.grad) for p in trainable_params if id(p) in clip_param_ids and p.grad is not None
+                ]
+                clip_all_grads = len(clip_param_ids) == len(trainable_params) and clip_param_ids == {
+                    id(p) for p in trainable_params
+                }
+                self._clip_gradients(
+                    clip_grads,
+                    max_norm=self.optim_cfg.max_grad_norm,
+                    dtype=dtype,
+                    precomputed_grad_info=(total_grad_norm, grouped_all_grads) if clip_all_grads else None,
+                )
+            ProberList.after_clip_grad_norm(self.model, total_grad_norm)
+            return total_grad_norm
 
     @staticmethod
     def _clip_gradients(

@@ -6,14 +6,26 @@ from torch import nn
 from torch.distributed.tensor import DTensor
 
 from xtuner.v1.ops import rms_norm, zero_centered_rms_norm
+from xtuner.v1.utils.profile import attach_l2_backward, profile_range
 
 
 class RMSNorm(nn.Module):
+    """RMSNorm is equivalent to T5LayerNorm.
+
+    ``l2_name`` records ``xtuner.L2.{l2_name}.*`` for the model-level final
+    norm only. Per-layer RMSNorms leave it unset.
+    """
+
     weight: torch.Tensor
     zero_centered: bool
 
-    def __init__(self, hidden_size: int, eps: float = 1e-6, type: Literal["default", "zero_centered"] = "default"):
-        """RMSNorm is equivalent to T5LayerNorm."""
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        type: Literal["default", "zero_centered"] = "default",
+        l2_name: str | None = None,
+    ):
         super().__init__()
 
         self.zero_centered = type == "zero_centered"
@@ -23,6 +35,7 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.full((hidden_size,), init_value))
         self.variance_epsilon = eps
         self._type = type
+        self._l2_name = l2_name
 
         if type == "default":
             self.rms_norm_fn = rms_norm
@@ -37,14 +50,13 @@ class RMSNorm(nn.Module):
         else:
             weight = self.weight
 
-        # just for align
-        # input_dtype = hidden_states.dtype
-        # hidden_states = hidden_states.to(torch.float32)
-        # variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        # hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        # return (weight * hidden_states).to(input_dtype)  # gpt_oss
-        # return weight * hidden_states.to(input_dtype)  # Llama
-        return self.rms_norm_fn(hidden_states, weight, epsilon=self.variance_epsilon)  # type: ignore[operator]
+        if self._l2_name is None:
+            return self.rms_norm_fn(hidden_states, weight, epsilon=self.variance_epsilon)  # type: ignore[operator]
+
+        # Inside the module so FSDP unshard stays outside the L2 range.
+        with profile_range(2, f"{self._l2_name}.forward"):
+            hidden_states = self.rms_norm_fn(hidden_states, weight, epsilon=self.variance_epsilon)  # type: ignore[operator]
+        return attach_l2_backward(hidden_states, self._l2_name)
 
     def init_weights(self):
         init_value = 0.0 if self.zero_centered else 1.0

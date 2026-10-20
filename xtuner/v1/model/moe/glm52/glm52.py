@@ -56,7 +56,11 @@ MOE_NON_EP_COMPILE_CFG: dict[str, TorchCompileOption] = {
     "xtuner.v1.module.decoder_layer.moe_decoder_layer.MoEDecoderLayer._post_moe_forward": TorchCompileOption(
         fullgraph=True
     ),
-    "xtuner.v1.model.moe.glm52.decoder_layer.GLM52DenseDecoderLayer.forward": TorchCompileOption(fullgraph=False),
+    # Compile the layer body, not ``forward``: the ``xtuner.L2.layerN.*`` profile range opened in ``forward``
+    # would otherwise be traced away and dense layers would vanish from time profiles.
+    "xtuner.v1.model.moe.glm52.decoder_layer.GLM52DenseDecoderLayer._glm52_forward": TorchCompileOption(
+        fullgraph=False
+    ),
     **DEFAULT_FLOAT8_CFG,
 }
 

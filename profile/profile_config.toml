@@ -1,0 +1,91 @@
+# Naming and grouping rules for profile/trace_extract.py, analyze_step.py and analyze_ranks.py.
+#
+# Every GPU event gets
+#   resource  what it occupies: compute / deepep / nccl / memcpy
+#   l4        operator label, from the CPU op that launched it (custom op, aten op, autograd Function, Inductor
+#             kernel) or from the kernel name
+#   l3        block the operator belongs to (attention, moe_gemm, fp8_quant, ...)
+# Patterns are Python regexes applied with re.search; within a list the first match wins.
+# The rules are applied when the parquet tables are loaded, so edits take effect without re-extracting traces.
+
+[device]
+# Dense peak TFLOP/s used for the "% peak" column (H200 SXM).
+peak_tflops = { bf16 = 989.0, fp8 = 1979.0 }
+
+[resource]
+# Matched against the kernel name; anything else is "compute".
+nccl = '^nccl(?:Dev)?Kernel'
+deepep = 'deep_ep::'
+memcpy = '^Mem(?:cpy|set)'
+
+[comm]
+# NCCL kernels carry their process group and collective in the trace; these maps shorten them to "<group> <verb>".
+groups = { "mesh_default.fsdp" = "fsdp", "mesh_sp" = "sp", "mesh_default.ep" = "ep", "default_pg" = "world", "mesh_reduce" = "reduce", "mesh_tilewise_reduce" = "reduce" }
+verbs = { "_allgather_base" = "AG", "allgather_into_tensor_coalesced" = "AG", "all_gather_into_tensor" = "AG", "_reduce_scatter_base" = "RS", "reduce_scatter_tensor_coalesced" = "RS", "reduce_scatter_tensor" = "RS", "allreduce" = "AR", "allreduce_coalesced" = "AR", "all_to_allv" = "A2A", "all_to_all" = "A2A", "broadcast" = "BC" }
+
+[l4]
+# Label rules, matched against "<op>|<kernel>".  The label may use {op}, {kernel} and regex groups {1}, {2}, ...
+# Unmatched events keep the op name (custom ops such as moe::permute already say what they are) or the kernel name.
+rules = [
+  { match = 'deep_ep::(?:intranode::|internode::|layout::)?(\w+)', label = "deepep {1}" },
+  { match = 'Memcpy HtoD', label = "memcpy H2D" },
+  { match = 'Memcpy DtoH', label = "memcpy D2H" },
+  { match = 'Memcpy DtoD', label = "memcpy D2D" },
+  { match = 'Memset', label = "memset" },
+  { match = '^moe::gemm_fp8_fp8_bf16_nt\|', label = "fp8_gemm" },
+  { match = '^moe::m_grouped\w*gemm\w*\|', label = "fp8_grouped_gemm" },
+  { match = '^moe::k_grouped_gemm_dw\w*\|', label = "fp8_grouped_gemm_dw" },
+  { match = '^sparse_mla::\w*sparse_mla_forward\|', label = "sparse_mla_fwd" },
+  { match = '^sparse_mla::\w*sparse_mla_backward\|', label = "sparse_mla_bwd" },
+  { match = '^sparse_mla::(\w*topk\w*)\|', label = "indexer {1}" },
+  # Inductor kernels: the launcher is named after the kernel, so name them by what they fuse.
+  { match = '^triton_\w+_fused_\w*_fused_rms_norm_backward\w*\|', label = "rmsnorm_bwd (inductor)" },
+  { match = '^triton_\w+_fused_\w*(mean_mul_pow_rsqrt|_fused_rms_norm)\w*\|', label = "rmsnorm_fwd (inductor)" },
+  { match = '^triton_\w+_fused_\w*cat_clone_\w*mul_neg\w*\|', label = "rope_cat (inductor)" },
+  { match = '^triton_\w+_fused_\w*silu\w*\|', label = "silu_mul (inductor)" },
+  { match = '^triton_\w+_fused_\w*(abs_amax|clamp_clone_div)\w*\|', label = "fp8_cast (inductor)" },
+  { match = '^triton_\w+_fused_\w*quant\w*\|', label = "fp8_quant (inductor)" },
+  { match = '^triton_(?:poi|red|per)_fused_(\w{1,40})\w*?(?:_\d+)?\|', label = "inductor {1}" },
+]
+
+[l3]
+# Block rules, matched against "<l4>|<op>|<kernel>".  NCCL events become "<group> comm" and memcpy events "memcpy"
+# before these rules run; anything unmatched is "elementwise".
+rules = [
+  # DeepEP notify kernels are EP-group barriers: their duration is mostly waiting for the slowest EP rank.
+  { match = '^deepep \w*notify', block = "moe_barrier" },
+  { match = '^deepep', block = "moe_comm" },
+  { match = 'sparse_mla|xtuner_kda|fused_kda|indexer|rope_cat|flash_attn|dsa', block = "attention" },
+  # Before moe_gemm: the permute kernels live in the grouped_gemm:: namespace.
+  { match = '^moe::(permute|unpermute|repeat_interleave)|router|topk', block = "moe_route" },
+  { match = 'grouped_gemm', block = "moe_gemm" },
+  { match = 'silu|gelu|swiglu', block = "activation" },
+  { match = 'quant|fp8_cast|^float8::', block = "fp8_quant" },
+  { match = 'gemm|^aten::(mm|bmm|addmm|matmul|linear)\||nvjet|cutlass|cublas', block = "gemm" },
+  { match = 'rmsnorm|rms_norm|layer_norm', block = "norm" },
+]
+
+[flops]
+# FLOPs of an op instance, from the "Input Dims" the trace records for the launching CPU op (list d, one entry per
+# input).  "mnk" gives the GEMM shape M, N, K (FLOPs = 2*M*N*K, and the tables show MxNxK); "flops" gives any other
+# count.  dtype selects the peak in [device].
+rules = [
+  { op = '^moe::gemm_fp8_fp8_bf16_nt$', mnk = "d[0][0][0], d[1][0][0], d[0][0][1]", dtype = "fp8" },
+  { op = '^moe::m_grouped\w*gemm\w*$', mnk = "d[0][0], d[2][1], d[0][1]", dtype = "fp8" },
+  { op = '^moe::k_grouped_gemm_dw\w*$', mnk = "d[0][1], d[0][0], d[2][0]", dtype = "fp8" },
+  { op = '^aten::mm$', mnk = "d[0][0], d[1][1], d[0][1]", dtype = "bf16" },
+  { op = '^aten::bmm$', mnk = "d[0][0] * d[0][1], d[1][2], d[0][2]", dtype = "bf16" },
+  { op = '^aten::addmm$', mnk = "d[1][0], d[2][1], d[1][1]", dtype = "bf16" },
+  # Sparse MLA over top-k keys: QK^T on d_qk = 576 and PV on d_v = d_qk - 64; backward redoes QK^T and adds dQ, dK, dP, dV.
+  { op = 'sparse_mla_forward$', flops = "2 * d[0][0] * d[0][1] * d[2][2] * (2 * d[0][2] - 64)", dtype = "bf16" },
+  { op = 'sparse_mla_backward$', flops = "2 * d[0][0] * d[0][1] * d[4][2] * (3 * d[0][2] + 2 * d[2][2])", dtype = "bf16" },
+]
+
+[report]
+top_kernels = 20          # rows in the hot-kernel table
+l3_groups = 3             # layer groups (kind x phase) with an L3/L4 breakdown, largest total wall first
+top_l4 = 25               # L4 rows per layer group
+gap_min_ms = 1.0          # idle gaps shorter than this are summed into one row
+host_stall_ms = 5.0       # aten::empty / empty_strided slower than this is an allocator stall
+gantt_merge_us = 30.0     # consecutive kernels of the same L4 op closer than this merge into one Gantt bar
+gantt_max_bars = 40       # per Gantt chart; the shortest bars are dropped first
