@@ -33,17 +33,16 @@ def fake_collator(instances: list[DataItem], **kwargs):
     return instances
 
 
-def _prepare_retained_media(instance, seq_ctx, shifted_labels, media_pipeline):
+def _prepare_retained_media(instance, seq_ctx, media_pipeline):
     if media_pipeline is None or not media_pipeline.enabled:
         return instance
-    from .media.provider import create_provider
     from .media.providers import resolve_mixed_media_items
+    from .media.schema import MediaPlan
 
     instance = resolve_mixed_media_items(list(instance), media_pipeline)
     plans = [item["media_plan"] for item in instance if item.get("media_plan") is not None]
     if plans:
-        provider = create_provider(plans[0].provider, plans[0].processor_config_json)
-        seq_ctx.media_plan = provider.merge_plans(plans)
+        seq_ctx.media_plan = MediaPlan.merge(plans)
     return instance
 
 
@@ -175,7 +174,7 @@ def sft_llm_collator(
             pack_to_max_length,
             pad_chunk_size,
         )
-        _prepare_retained_media(instance, seq_ctx, shifted_labels, media_pipeline)
+        _prepare_retained_media(instance, seq_ctx, media_pipeline)
         ret.append(
             {
                 "seq_ctx": seq_ctx,
@@ -294,7 +293,7 @@ def qwen3_vl_sft_collator(
             pack_to_max_length,
             pad_chunk_size,
         )
-        instance = _prepare_retained_media(instance, seq_ctx, shifted_labels, media_pipeline)
+        instance = _prepare_retained_media(instance, seq_ctx, media_pipeline)
 
         all_position_ids_none = all(
             "position_ids" not in _instance or _instance["position_ids"] is None for _instance in instance
@@ -385,7 +384,7 @@ def glm53_vl_sft_collator(
             pack_to_max_length,
             pad_chunk_size,
         )
-        instance = _prepare_retained_media(instance, seq_ctx, shifted_labels, media_pipeline)
+        instance = _prepare_retained_media(instance, seq_ctx, media_pipeline)
 
         num_img_tokens: list[list[int]] = [data.get("num_img_tokens", [0]) for data in instance]
 

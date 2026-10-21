@@ -1,6 +1,7 @@
 import copy
 import json
 import pickle
+from dataclasses import replace
 
 import pytest
 
@@ -86,3 +87,53 @@ def test_delivery_proof_rejects_dropped_media_field():
     proof = MediaDeliveryProof("run:step:micro", make_plan().fingerprint, make_plan().output_specs)
     with pytest.raises(ValueError, match="missing"):
         proof.validate_context(type("Context", (), {"fixture": None})())
+
+
+@pytest.mark.parametrize("field,value", [
+    ("provider", "another"),
+    ("provider_version", "2"),
+    ("processor_config_json", '{"variant":1}'),
+    ("processor_fingerprint", "different"),
+    ("source_manifest_fingerprint", "different"),
+])
+def test_packing_rejects_mixed_processing_identities(field, value):
+    plan = make_plan()
+    with pytest.raises(ValueError, match="identities"):
+        MediaPlan.merge([plan, replace(plan, **{field: value})])
+
+
+def test_packing_preserves_repetition_order_and_nested_decisions():
+    first = make_plan()
+    second = replace(first, sample_ids=("record-2",), decisions_json='{"crop":2}')
+    merged = MediaPlan.merge([first, second, first])
+    assert merged.entries == first.entries + second.entries + first.entries
+    assert merged.sample_ids == ("record-1", "record-2", "record-1")
+    assert merged.output_specs == (TensorSpec("fixture", "float32", (18, 4)),)
+    assert json.loads(merged.decisions_json) == {"merged_decisions": [{}, {"crop": 2}, {}]}
+    nested = MediaPlan.merge([merged])
+    assert json.loads(nested.decisions_json) == {"merged_decisions": [{"merged_decisions": [{}, {"crop": 2}, {}]}]}
+    assert MediaPlan.from_json(merged.to_json()) == merged
+    assert pickle.loads(pickle.dumps(merged)) == merged
+
+
+def test_packing_rejects_schema_lie_before_allocating():
+    plan = make_plan()
+    changed = replace(plan, output_specs=(TensorSpec("fixture", "float32", (12, 4)),))
+    with pytest.raises(ValueError, match="ordered semantic units"):
+        MediaPlan.merge([changed])
+    with pytest.raises(ValueError, match="empty"):
+        MediaPlan.merge([])
+
+
+@pytest.mark.parametrize("spec", [
+    TensorSpec("renamed", "float32", (6, 4)),
+    TensorSpec("fixture", "bfloat16", (6, 4)),
+    TensorSpec("fixture", "float32", (6, 5)),
+    TensorSpec("fixture", "float32", (6, 4), concat_dim=1),
+    TensorSpec("fixture", "float32", (6, 4), concat_dim=None),
+])
+def test_packing_rejects_incompatible_tensor_layouts(spec):
+    plan = make_plan()
+    changed = replace(plan, entries=(replace(plan.entries[0], output_specs=(spec,)),), output_specs=(spec,))
+    with pytest.raises(ValueError, match="schemas"):
+        MediaPlan.merge([plan, changed])

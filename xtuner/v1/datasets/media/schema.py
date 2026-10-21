@@ -1,8 +1,8 @@
 import hashlib
 import json
 import math
-from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Any, Mapping
+from dataclasses import asdict, dataclass, field, replace
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 
 if TYPE_CHECKING:
@@ -49,6 +49,29 @@ class TensorSpec:
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "TensorSpec":
         return cls(**{**value, "shape": tuple(value["shape"])})
+
+
+def concatenate_specs(groups: Sequence[tuple[TensorSpec, ...]]) -> tuple[TensorSpec, ...]:
+    """Describe ordered axis-zero concatenation without allocating tensors.
+
+    This is the assembly contract currently supported by the media pipeline.
+    Other layouts must define their own assembly contract before using packing.
+    """
+    if not groups:
+        raise ValueError("cannot concatenate an empty tensor schema list")
+    if any(len(group) != len(groups[0]) for group in groups):
+        raise ValueError("tensor field count differs")
+    combined = []
+    for index, first in enumerate(groups[0]):
+        fields = [group[index] for group in groups]
+        if any(
+            (field.name, field.dtype, field.shape[1:], field.concat_dim)
+            != (first.name, first.dtype, first.shape[1:], 0)
+            for field in fields
+        ):
+            raise ValueError("incompatible tensor schemas for axis-zero concatenation")
+        combined.append(TensorSpec(first.name, first.dtype, (sum(field.shape[0] for field in fields), *first.shape[1:])))
+    return tuple(combined)
 
 
 @dataclass(frozen=True)
@@ -127,6 +150,37 @@ class MediaPlan:
             raise ValueError("duplicate plan output field")
         validate_json_object(self.processor_config_json)
         validate_json_object(self.decisions_json)
+
+    def validate_outputs(self) -> None:
+        """Check that the declared pack matches its ordered semantic units."""
+        if self.output_specs != concatenate_specs([entry.output_specs for entry in self.entries]):
+            raise ValueError("plan output schema differs from its ordered semantic units")
+
+    @classmethod
+    def merge(cls, plans: Sequence["MediaPlan"]) -> "MediaPlan":
+        """Pack descriptions in order; no provider, source I/O, or decoding.
+
+        Repeated occurrences remain repeated. Decision nesting and serialized
+        identities match the original provider-owned merge operation.
+        """
+        if not plans:
+            raise ValueError("cannot merge an empty media plan list")
+        first = plans[0]
+        identity_fields = (
+            "protocol_version", "provider", "provider_version", "processor_config_json",
+            "processor_fingerprint", "source_manifest_fingerprint",
+        )
+        for plan in plans:
+            if any(getattr(plan, name) != getattr(first, name) for name in identity_fields):
+                raise ValueError("cannot mix media provider/configuration/manifest identities")
+            plan.validate_outputs()
+        return replace(
+            first,
+            entries=tuple(entry for plan in plans for entry in plan.entries),
+            output_specs=concatenate_specs([plan.output_specs for plan in plans]),
+            sample_ids=tuple(sample for plan in plans for sample in plan.sample_ids),
+            decisions_json=canonical_json({"merged_decisions": [json.loads(plan.decisions_json) for plan in plans]}),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

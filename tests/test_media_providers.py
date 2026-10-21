@@ -159,13 +159,13 @@ def test_merge_keeps_occurrences_and_rejects_identity_change(image_fixture):
         _plan(fixture, sources=[source], occurrence_id=f"record-{index}")
         for index, source in enumerate(fixture.sources)
     ]
-    merged = fixture.provider.merge_plans(plans)
+    merged = MediaPlan.merge(plans)
     assert merged.entries == tuple(entry for plan in plans for entry in plan.entries)
     assert merged.sample_ids == ("record-0", "record-1")
     assert merged.output_specs == _plan(fixture).output_specs
     with pytest.raises(ValueError, match="identities"):
-        fixture.provider.merge_plans([plans[0], replace(plans[1], source_manifest_fingerprint="different")])
-    repeated = fixture.provider.merge_plans([plans[0], plans[0]])
+        MediaPlan.merge([plans[0], replace(plans[1], source_manifest_fingerprint="different")])
+    repeated = MediaPlan.merge([plans[0], plans[0]])
     assert len(repeated.entries) == 2
     assert repeated.output_specs[0].shape[0] == 2 * plans[0].output_specs[0].shape[0]
 
@@ -185,7 +185,7 @@ def test_changed_manifest_and_weak_descriptors_are_rejected(image_fixture):
     fixture = image_fixture
     with pytest.raises(ValueError, match="descriptor differs"):
         fixture.provider.describe(
-            [replace(fixture.sources[0], metadata_json="{}")],
+            [replace(fixture.sources[0], metadata_json='{"forged_certificate":true}')],
             occurrence_id="bad",
             per_image=True,
             source_manifest_fingerprint=fixture.provider.manifest_fingerprint,
@@ -463,7 +463,7 @@ def test_bf16_pixel_dtype_changes_only_transport_identity_and_specs(image_fixtur
         certified_peak = sum(bf16.provider._profile(source)["estimated_peak_bytes"] for source in entry.sources)
         assert entry.estimated_peak_bytes == certified_peak + sum(spec.nbytes for spec in entry.output_specs)
     with pytest.raises(ValueError, match="identities"):
-        bf16.provider.merge_plans([bf16_plan, native_plan])
+        MediaPlan.merge([bf16_plan, native_plan])
 
 
 @pytest.mark.parametrize("per_image", (False, True))
@@ -579,3 +579,103 @@ def test_pixel_dtype_rejects_unknown_provider_values(image_fixture):
     config["pixel_dtype"] = "float16"
     with pytest.raises(ValueError, match="pixel_dtype"):
         create_provider(fixture.name, canonical_json(config))
+
+
+def _embedded_certificate_plan(fixture, plan):
+    """Reconstruct the V1 wire representation for the exact same occurrences."""
+    return replace(
+        plan,
+        entries=tuple(
+            replace(entry, sources=tuple(
+                replace(source, metadata_json=canonical_json(fixture.provider.certificates[source.uri]))
+                for source in entry.sources
+            ))
+            for entry in plan.entries
+        ),
+    )
+
+
+def test_compact_sources_keep_semantics_and_read_old_plans(image_fixture):
+    import pickle
+    from contextlib import closing
+
+    from xtuner.v1.datasets.media.materializer import MediaMaterializer
+
+    fixture = _with_pixel_dtype(image_fixture, "bfloat16")
+    compact = _plan(fixture)
+    embedded = _embedded_certificate_plan(fixture, compact)
+    assert all(source.metadata_json == "{}" for entry in compact.entries for source in entry.sources)
+    assert compact.output_specs == embedded.output_specs
+    assert compact.processor_fingerprint == embedded.processor_fingerprint
+    assert compact.source_manifest_fingerprint == embedded.source_manifest_fingerprint
+    assert compact.fingerprint != embedded.fingerprint  # Representation changed; never reuse an old plan identity.
+    assert len(compact.to_json().encode()) < len(embedded.to_json().encode())
+    assert MediaPlan.from_json(compact.to_json()) == compact
+    assert pickle.loads(pickle.dumps(compact)) == compact
+    assert MediaPlan.from_json(embedded.to_json()) == embedded
+    assert tuple(entry.estimated_peak_bytes for entry in compact.entries) == tuple(
+        entry.estimated_peak_bytes for entry in embedded.entries
+    )
+    with closing(MediaMaterializer(_pipeline(fixture.manifest, pixel_dtype="bfloat16"))) as materializer:
+        before = materializer.materialize(embedded)
+        after = materializer.materialize(compact)
+        # Only descriptor/control bytes shrink; native image/pixel reservations do not.
+        difference = len(embedded.to_json().encode()) - len(compact.to_json().encode())
+        assert materializer.reservation_bytes(embedded) - materializer.reservation_bytes(compact) == 4 * difference
+    for field in compact.output_specs:
+        assert torch.equal(before.tensors[field.name], after.tensors[field.name])
+    assert before.tensors["pixel_values"].dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("embedded", (False, True))
+@pytest.mark.parametrize("field,value", [
+    ("revision", "object-version:forged"),
+    ("width", 128),
+    ("height", 128),
+    ("orientation", 8),
+    ("source_bytes", 99999),
+    ("content_sha256", "f" * 64),
+])
+def test_compact_and_old_descriptors_reject_changed_source_facts_before_decode(image_fixture, embedded, field, value):
+    fixture = image_fixture
+    source = fixture.sources[0]
+    if embedded:
+        source = replace(source, metadata_json=canonical_json(fixture.certificates[0]))
+    source = replace(source, **{field: value})
+    with patch.object(Image, "open", side_effect=AssertionError("forged descriptor reached decode")):
+        with pytest.raises(ValueError, match="identity/geometry differs"):
+            _plan(fixture, sources=[source])
+
+
+def test_old_embedded_certificate_cannot_override_frozen_manifest(image_fixture):
+    fixture = image_fixture
+    forged = copy.deepcopy(fixture.certificates[0])
+    forged["profiles"][fixture.profile_key]["image_grid_thw"][1] += 2
+    source = replace(fixture.sources[0], metadata_json=canonical_json(forged))
+    with pytest.raises(ValueError, match="descriptor differs"):
+        _plan(fixture, sources=[source])
+
+
+def test_compact_descriptors_do_not_replicate_unselected_certificate_data(image_fixture):
+    fixture = image_fixture
+    original = _plan(fixture)
+    certificates = copy.deepcopy(fixture.certificates)
+    for certificate in certificates:
+        certificate["profiles"]["another-processor-profile"] = {"unrelated": "x" * 16384}
+        certificate["audit_note"] = "offline verification notes" * 100
+    manifest = fixture.manifest.with_name("many-profiles.json")
+    manifest.write_text(canonical_json({"schema_version": 1, "sources": certificates}))
+    provider = create_provider(
+        fixture.name, shared.make_image_provider_config(fixture.name, fixture.processor, str(manifest))
+    )
+    sources = provider.sources_for_uris([source.uri for source in fixture.sources])
+    assert sources == fixture.sources
+    plan = provider.describe(sources, occurrence_id="record", per_image=True,
+                             source_manifest_fingerprint=provider.manifest_fingerprint)
+    assert plan.entries == original.entries
+    assert plan.source_manifest_fingerprint != original.source_manifest_fingerprint
+    assert plan.fingerprint != original.fingerprint  # Unselected data is still bound by the manifest hash.
+    assert "unrelated" not in plan.to_json()
+    # No repeated certificate serialization on the compact lookup path.
+    with patch.object(shared, "canonical_json", side_effect=AssertionError("lookup serialized a certificate")):
+        assert provider._profile(sources[0]) == certificates[0]["profiles"][fixture.profile_key]

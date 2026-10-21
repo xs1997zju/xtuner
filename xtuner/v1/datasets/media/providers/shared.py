@@ -8,7 +8,15 @@ from pathlib import Path
 from typing import Literal, Sequence
 
 from ..provider import ProviderCapabilities, create_provider
-from ..schema import MaterializedMedia, MediaEntry, MediaPlan, MediaSource, TensorSpec, canonical_json
+from ..schema import (
+    MaterializedMedia,
+    MediaEntry,
+    MediaPlan,
+    MediaSource,
+    TensorSpec,
+    canonical_json,
+    concatenate_specs,
+)
 from .source_io import UnsupportedSourceIO, read_verified_local_source, require_local_source
 
 
@@ -55,27 +63,14 @@ def make_image_provider_config(
     return canonical_json(config)
 
 
-def _combined_specs(spec_groups: Sequence[tuple[TensorSpec, ...]]) -> tuple[TensorSpec, ...]:
-    if not spec_groups:
-        raise ValueError("cannot assemble an empty image plan")
-    combined = []
-    if any(len(group) != len(spec_groups[0]) for group in spec_groups):
-        raise ValueError("image tensor field count differs")
-    for field_index, first in enumerate(spec_groups[0]):
-        fields = [group[field_index] for group in spec_groups]
-        if any(
-            (field.name, field.dtype, field.shape[1:], field.concat_dim)
-            != (first.name, first.dtype, first.shape[1:], 0)
-            for field in fields
-        ):
-            raise ValueError("incompatible image tensor schemas")
-        combined.append(
-            TensorSpec(first.name, first.dtype, (sum(field.shape[0] for field in fields), *first.shape[1:]))
-        )
-    return tuple(combined)
-
-
 class CertifiedImageProvider:
+    """Resolve compact source facts against one frozen certificate manifest.
+
+    The plan carries the ordered processor outputs needed for packing. Full
+    certificates stay here; nonempty source metadata is a checked legacy copy.
+    Native processing and source verification use the same manifest in both cases.
+    """
+
     capabilities = ProviderCapabilities(metadata_exact=True, independent_images=True)
     version = "1"
     name: str
@@ -138,7 +133,6 @@ class CertifiedImageProvider:
                 orientation=certificate["orientation"],
                 source_bytes=certificate["source_bytes"],
                 content_sha256=certificate["content_sha256"],
-                metadata_json=canonical_json(certificate),
             )
             content_revision = f"sha256:{source.content_sha256}"
             object_revision = source.revision.startswith("object-version:") and len(source.revision) > len(
@@ -156,7 +150,9 @@ class CertifiedImageProvider:
 
     def _profile(self, source: MediaSource) -> dict:
         expected = self.sources_for_certificate(source.uri)
-        if canonical_json(expected) != source.metadata_json:
+        # New descriptors carry source facts, not another copy of the manifest.
+        # Accept old embedded certificates only when they still match exactly.
+        if source.metadata_json != "{}" and source.metadata_json != canonical_json(expected):
             raise ValueError("source descriptor differs from frozen certificate")
         if any(
             getattr(source, field) != expected[field]
@@ -221,7 +217,7 @@ class CertifiedImageProvider:
         for group_index, group in enumerate(groups):
             if not group:
                 raise ValueError("image describe needs at least one source")
-            specs = _combined_specs([self._source_specs(source) for source in group])
+            specs = concatenate_specs([self._source_specs(source) for source in group])
             peaks = [self._profile(source)["estimated_peak_bytes"] for source in group]
             peak = sum(peaks) + sum(spec.nbytes for spec in specs)
             entries.append(
@@ -242,7 +238,7 @@ class CertifiedImageProvider:
             processor_fingerprint=self.processor_fingerprint,
             source_manifest_fingerprint=self.manifest_fingerprint,
             entries=tuple(entries),
-            output_specs=_combined_specs([entry.output_specs for entry in entries]),
+            output_specs=concatenate_specs([entry.output_specs for entry in entries]),
             sample_ids=(occurrence_id,),
             decisions_json=decisions_json,
         )
@@ -275,7 +271,7 @@ class CertifiedImageProvider:
             raise
 
     def process(self, entry: MediaEntry) -> MaterializedMedia:
-        expected_specs = _combined_specs([self._source_specs(source) for source in entry.sources])
+        expected_specs = concatenate_specs([self._source_specs(source) for source in entry.sources])
         expected_peak = sum(self._profile(source)["estimated_peak_bytes"] for source in entry.sources)
         expected_peak += sum(spec.nbytes for spec in expected_specs)
         if expected_specs != entry.output_specs or entry.estimated_peak_bytes < expected_peak:
@@ -291,7 +287,7 @@ class CertifiedImageProvider:
             )
             native_specs = (
                 expected_specs if self.pixel_dtype == "native"
-                else _combined_specs([self._native_source_specs(source) for source in entry.sources])
+                else concatenate_specs([self._native_source_specs(source) for source in entry.sources])
             )
             result.validate(native_specs)
             if result.tensors["image_grid_thw"].tolist() != [
@@ -357,25 +353,7 @@ class CertifiedImageProvider:
             plan.source_manifest_fingerprint,
         ) != (self.name, self.version, self.config_json, self.processor_fingerprint, self.manifest_fingerprint):
             raise ValueError("cannot mix image provider/configuration/manifest identities")
-        if plan.output_specs != _combined_specs([entry.output_specs for entry in plan.entries]):
-            raise ValueError("plan output schema differs from its ordered semantic units")
-
-    def merge_plans(self, plans: Sequence[MediaPlan]) -> MediaPlan:
-        if not plans:
-            raise ValueError("cannot merge an empty image plan list")
-        for plan in plans:
-            self._validate_plan(plan)
-        return MediaPlan(
-            provider=self.name,
-            provider_version=self.version,
-            processor_config_json=self.config_json,
-            processor_fingerprint=self.processor_fingerprint,
-            source_manifest_fingerprint=self.manifest_fingerprint,
-            entries=tuple(entry for plan in plans for entry in plan.entries),
-            output_specs=_combined_specs([plan.output_specs for plan in plans]),
-            sample_ids=tuple(sample_id for plan in plans for sample_id in plan.sample_ids),
-            decisions_json=canonical_json({"merged_decisions": [json.loads(plan.decisions_json) for plan in plans]}),
-        )
+        plan.validate_outputs()
 
 
 def _materialize_plans(plans, config):

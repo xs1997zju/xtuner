@@ -60,3 +60,26 @@ def test_disabled_pipeline_does_not_add_identity():
     items = [{"seq_ctx": seq_ctx, "shifted_labels": torch.tensor([[2, 3, 4, -100]])}]
     assert _finalize_media_packs(items, MediaPipelineConfig()) is items
     assert seq_ctx.media_pack_id is None
+
+
+def test_planned_collation_does_not_construct_provider_or_read_manifest(monkeypatch):
+    from pathlib import Path
+
+    from xtuner.v1.datasets.collator import _prepare_retained_media
+    from xtuner.v1.datasets.media import MediaEntry, MediaPlan, MediaSource, TensorSpec, provider
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("packing descriptions must not construct providers or read manifests")
+
+    monkeypatch.setattr(provider, "create_provider", forbidden)
+    monkeypatch.setattr(Path, "read_bytes", forbidden)
+    spec = TensorSpec("pixel_values", "bfloat16", (4, 8))
+    entry = MediaEntry("record-0", (MediaSource("fixture://image", "frozen", 2, 2),), (spec,), 1024)
+    plan = MediaPlan("unregistered-fixture", "1", "{}", "processor", "manifest", (entry,), (spec,))
+    config = MediaPipelineConfig(enabled=True, max_inflight_bytes=2**20, max_pending_tasks=1)
+    seq_ctx = context()
+    items = [{"media_plan": plan}, {"media_plan": plan}]
+    retained = _prepare_retained_media(items, seq_ctx, config)
+    assert retained == items
+    assert seq_ctx.media_plan == MediaPlan.merge([plan, plan])
+    assert seq_ctx.media_plan.entries == (entry, entry)

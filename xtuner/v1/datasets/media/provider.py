@@ -26,8 +26,6 @@ class MediaProvider(Protocol):
 
     def assemble(self, plan: MediaPlan, ordered_results: Sequence[MaterializedMedia]) -> MaterializedMedia: ...
 
-    def merge_plans(self, plans: Sequence[MediaPlan]) -> MediaPlan: ...
-
 
 _REGISTRY: dict[str, Callable[[str], MediaProvider] | str] = {}
 

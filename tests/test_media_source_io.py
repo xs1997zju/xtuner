@@ -58,7 +58,7 @@ def load_provider_helpers(importer):
     provider = next(
         node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "CertifiedImageProvider"
     )
-    selected = {"sources_for_certificate", "_profile", "_source_specs", "sources_for_uris", "describe", "_read_source"}
+    selected = {"sources_for_certificate", "_profile", "_native_source_specs", "_source_specs", "sources_for_uris", "describe", "_read_source"}
     nodes = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "UnsupportedMediaSource"]
     nodes.extend(node for node in provider.body if isinstance(node, ast.FunctionDef) and node.name in selected)
     nodes.extend(
@@ -77,7 +77,7 @@ def load_provider_helpers(importer):
         "io": io,
         "json": json,
         "math": math,
-        "_combined_specs": lambda groups: (),
+        "concatenate_specs": lambda groups: (),
         "image_processor_identity": Mock(return_value={"frozen": True}),
         "_materialize_plans": Mock(side_effect=AssertionError("unsupported source reached materializer")),
         "__builtins__": {**vars(builtins), "__import__": importer},
@@ -248,6 +248,7 @@ class ProviderSourceBoundaryTests(unittest.TestCase):
         for name in (
             "sources_for_certificate",
             "_profile",
+            "_native_source_specs",
             "_source_specs",
             "sources_for_uris",
             "describe",

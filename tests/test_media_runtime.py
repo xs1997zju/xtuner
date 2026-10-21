@@ -380,7 +380,7 @@ class TestMediaMaterializer(_ProviderFixture, unittest.TestCase):
                         patch.object(_AssemblyProvider, "allocate_assembly", allocate),
                     ):
                         if count == 0:
-                            with self.assertRaisesRegex(ValueError, "cannot assemble an empty image plan"):
+                            with self.assertRaisesRegex(ValueError, "cannot concatenate an empty tensor schema list"):
                                 materializer.materialize(assembly_plan(count=count))
                             continue
                         result = materializer.materialize(assembly_plan(count=count))
