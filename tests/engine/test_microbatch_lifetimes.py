@@ -52,6 +52,8 @@ def test_microbatch_loss_detach_preserves_accumulation(monkeypatch, fail_second)
 
     engine = object.__new__(train_engine.TrainEngine)
     engine.model = Model()
+    engine._media_runtime = None
+    engine._media_lookahead = None
     engine.intra_layer_micro_batch = 1
     engine._count = 1
     engine._maybe_precompute_float8_dynamic_scale_for_fsdp = lambda: None
