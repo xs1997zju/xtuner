@@ -153,6 +153,24 @@ class Qwen3VLForConditionalGeneration(BaseComposeModel):
         sequence_parallel_mesh = seq_ctx.sequence_parallel_mesh
 
         inputs_embeds = self.language_model.embed_tokens(input_ids)  # type: ignore
+
+        if pixel_values is None and seq_ctx.media_plan is not None:
+            from xtuner.v1.datasets.mllm_tokenize_fn.glm53_vl_tokenize_fn import lazy_media_shared_decode
+            from xtuner.v1.train.lazy_media_prefetch import materialize_image_plan, shared_materialize, take_media_future
+
+            group = sequence_parallel_mesh.get_group() if sequence_parallel_mesh is not None else None
+            if group is not None and torch.distributed.get_world_size(group) > 1 and lazy_media_shared_decode():
+                patch = self.vision_tower.patch_embed
+                patch_dim = patch.in_channels * patch.temporal_patch_size * patch.patch_size ** 2
+                pixel_values, image_grid_thw = shared_materialize(
+                    seq_ctx.media_plan, group, inputs_embeds.device, patch_dim
+                )
+            else:
+                future = take_media_future(seq_ctx.media_plan)
+                pixel_values, image_grid_thw = (
+                    future.result() if future is not None else materialize_image_plan(seq_ctx.media_plan)
+                )
+                image_grid_thw = image_grid_thw.to(inputs_embeds.device)
         
         if pixel_values is not None:
             assert self.only_llm_forward is False, "only_llm_forward is True, but pixel_values is not None. Please check your config setting."

@@ -22,6 +22,7 @@ class InternS1DataItem(BaseMLLMDataItem, total=False):
 
 
 class QwenVL3DataItem(BaseMLLMDataItem, total=False):
+    media_plan: dict
     pixel_values: torch.Tensor
     image_grid_thw: torch.Tensor
     position_ids: torch.Tensor

@@ -8,7 +8,14 @@ import os
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Iterator
 
-from xtuner.v1.datasets.mllm_tokenize_fn.glm53_vl_tokenize_fn import materialize_image_plan
+from xtuner.v1.datasets.mllm_tokenize_fn.glm53_vl_tokenize_fn import materialize_image_plan as materialize_glm_image_plan
+
+
+def materialize_image_plan(plan):
+    if plan.get("processor_family") == "qwen":
+        from xtuner.v1.datasets.mllm_tokenize_fn.qwen3_vl_tokenize_fn import materialize_qwen_image_plan
+        return materialize_qwen_image_plan(plan)
+    return materialize_glm_image_plan(plan)
 
 
 def lazy_media_prefetch_enabled() -> bool:
