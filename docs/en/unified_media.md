@@ -17,8 +17,8 @@ This is a source diagram, not a rendered or runtime-validated figure:
 
 ```mermaid
 flowchart TD
-    A["Family tokenizer + provider.describe / merge_plans"] --> B["Immutable MediaPlan and native text/geometry"]
-    B --> C["datasets/collator.py: final semantic pack identity"]
+    A["Family tokenizer + provider.describe"] --> B["Immutable MediaPlan and native text/geometry"]
+    B --> C["collator: MediaPlan.merge + final pack identity"]
     C --> D["engine/train_engine.py: current-group consume"]
     D --> E["datasets/media/runtime.py: reservations + one lookahead"]
     E --> F["materializer.py: worker-local provider.process / assemble"]
@@ -206,7 +206,10 @@ the authorized experiment owner, not by marking guessed metadata as verified.
 | `describe(sources, *, occurrence_id, per_image, source_manifest_fingerprint, decisions_json="{}") -> MediaPlan` | Produce exact, data-only ordered descriptors; no decode or live processor/tensor inside the plan |
 | `process(entry: MediaEntry) -> MaterializedMedia` | CPU-only native processing of one semantic unit; close decoded originals and release temporaries on success/error |
 | `assemble(plan, ordered_results) -> MaterializedMedia` | Preserve semantic occurrence order and native concat/layout; its copies and scratch must be budgeted |
-| `merge_plans(plans) -> MediaPlan` | Merge only compatible provider/version/processor/source identities; preserve record order and decisions |
+
+Packing uses the data-only `MediaPlan.merge(plans)` operation, not a provider
+method. It checks provider/version/configuration/manifest identities and ordered
+axis-zero output schemas without creating a provider or reading source files.
 
 Capabilities default conservatively. Lazy processing requires `metadata_exact`;
 per-image processing requires `independent_images`. Worker-local instances are
@@ -244,6 +247,15 @@ and needs separate accounting outside tensor reservations.
 | `SequenceContext.media_plan` | Unresolved descriptor retained on the original batch; cannot be forwarded directly to the compose model |
 | `media_pack_id` | Final collator semantic identity, separate from the plan fingerprint and delivery proof |
 | `MediaDeliveryProof` | Engine-owned consumption ID, plan fingerprint and specs; shape/dtype delivery evidence, not pixel-equivalence or physical-lifetime proof |
+
+Built-in image providers emit compact `MediaSource` descriptors with empty JSON
+metadata. Full certificates stay in each provider's frozen manifest. Source facts
+must match that manifest, and actual bytes, geometry and native processor outputs
+remain verified. Older descriptors embedding a full certificate are accepted only
+when that copy exactly matches the frozen manifest. New descriptors have different
+fingerprints; regenerating plans is necessary to replace legacy cached descriptors.
+Older implementations cannot execute the compact representation; keep all SP ranks
+on the same source version and descriptor representation.
 
 Plans contain JSON/scalars/tuples, never Tensor/PIL/Future/executor/client/CUDA state.
 Provider output field names must map to actual native `SequenceContext` fields;
