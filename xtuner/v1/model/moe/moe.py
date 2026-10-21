@@ -1294,19 +1294,6 @@ class MoE(BaseModel):
         layers.__class__.__repr__ = module_dict_repr  # type: ignore[method-assign]
         return layers
 
-    def _get_mtp_attention_spec(
-        self, config: MoEConfig
-    ) -> tuple[str, MLAConfig | MHAConfig | GatedDeltaNetConfig | KDAConfig]:
-        layer_type = config.layers_type[config.num_hidden_layers - 1]
-        if layer_type in ["full_attention", "sliding_attention"]:
-            return layer_type, config.attention
-        if layer_type == "linear_attention":
-            assert config.linear_attention is not None, (
-                "linear_attention config must be provided for linear_attention layer"
-            )
-            return layer_type, config.linear_attention
-        raise ValueError(f"Unsupported layer type {layer_type}")
-
     def build_mtp_block(self, config: MoEConfig) -> MTPBlock:
         """Build MTP block with MoE decoder layers.
 
@@ -1320,7 +1307,20 @@ class MoE(BaseModel):
         assert mtp_config is not None, "mtp_config must be provided"
 
         mtp_layers = []
-        layer_type, attention_config = self._get_mtp_attention_spec(config)
+        # Get attention config for MTP layers (use last layer's config)
+        last_layer_idx = config.num_hidden_layers - 1
+        layers_type_list = config.layers_type
+        attention_config: MLAConfig | MHAConfig | GatedDeltaNetConfig | KDAConfig
+        if layers_type_list[last_layer_idx] in ["full_attention", "sliding_attention"]:
+            attention_config = config.attention
+        elif layers_type_list[last_layer_idx] == "linear_attention":
+            assert config.linear_attention is not None, (
+                "linear_attention config must be provided for linear_attention layer"
+            )
+            attention_config = config.linear_attention
+        else:
+            raise ValueError(f"Unsupported layer type {layers_type_list[last_layer_idx]}")
+
         num_physical_layer = 1 if mtp_config.share_weights else mtp_config.num_layers
         for i in range(num_physical_layer):
             # Build MoE decoder layer for MTP
@@ -1339,7 +1339,7 @@ class MoE(BaseModel):
                 n_shared_experts=config.n_shared_experts,
                 with_shared_expert_gate=config.with_shared_expert_gate,
                 hidden_factor=config.hidden_factor,
-                layer_type=layer_type,
+                layer_type=layers_type_list[last_layer_idx],
                 attention_config=attention_config,
                 rope_scaling_cfg=config.rope_scaling_cfg,
                 generate_config=config.generate_config,

@@ -42,10 +42,6 @@ MOE_EP_COMPILE_CFG.pop("xtuner.v1.module.decoder_layer.moe_decoder_layer.MoEDeco
 
 
 class Qwen3_5_VLTextMoE(Qwen3VLTextMoE):
-    @override
-    def _get_mtp_attention_spec(self, config: MoEConfig) -> tuple[str, MHAConfig]:
-        return "full_attention", config.attention
-
     def to_hf_key_list(self, key: str) -> list[str]:
         # Handle MTP parameters
         if key.startswith("mtp_block."):
