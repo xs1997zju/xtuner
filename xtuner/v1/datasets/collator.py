@@ -270,6 +270,27 @@ def qwen3_vl_sft_collator(
             if pack_to_max_length and pack_max_length - position_ids.shape[-1] > 0:
                 position_ids = pad_to_max_length(position_ids, 0, max_length=pack_max_length, dim=-1)
 
+        plans = [item["media_plan"] for item in instance if item.get("media_plan") is not None]
+        if plans and any("pixel_values" in item for item in instance):
+            # Missing-size eager fallbacks can share a pack with deferred images.
+            # In that case use the native eager payload for the entire pack.
+            from xtuner.v1.train.lazy_media_prefetch import materialize_image_plan
+            instance = [dict(item) for item in instance]
+            for item in instance:
+                plan = item.pop("media_plan", None)
+                if plan is not None:
+                    item["pixel_values"], item["image_grid_thw"] = materialize_image_plan(plan)
+            plans = []
+        if plans:
+            settings = ("processor_family", "processor_path", "min_pixels", "max_pixels", "oss_loader_cfg")
+            if any(any(plan.get(key) != plans[0].get(key) for key in settings) for plan in plans):
+                raise ValueError("Qwen images in one pack must share processor settings")
+            seq_ctx.media_plan = {
+                **{key: plans[0].get(key) for key in settings},
+                "images": [entry for plan in plans for entry in plan["images"]],
+                "sample_sizes": [count for plan in plans for count in plan["sample_sizes"]],
+            }
+
         num_img_tokens: list[list[int]] = []
         for data in instance:
             num_img_tokens.append(data.get("num_img_tokens", [0]))

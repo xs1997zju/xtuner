@@ -4,6 +4,8 @@ import copy
 import io
 import math
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, is_dataclass
 from itertools import chain
 from types import SimpleNamespace
@@ -43,6 +45,64 @@ from .qwenvl_rope2d import get_rope_index_3
 _PROCESSOR_CACHE: dict[str, tuple] = {}
 
 logger = get_logger()
+
+
+# Reuse the native image path for both Qwen multimodal templates.
+LAZY_CHAT_TEMPLATES = ("qwen3-vl", "qwen3.5-vl")
+
+
+def materialize_qwen_image_plan(plan: dict) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the native Qwen image processor; preserve source sample and image order."""
+    from .glm53_vl_tokenize_fn import lazy_media_threads
+
+    path = plan["processor_path"]
+    if path not in _PROCESSOR_CACHE:
+        processor = AutoProcessor.from_pretrained(path, trust_remote_code=True)
+        _PROCESSOR_CACHE[path] = (processor.image_processor, processor.video_processor)
+    processor = copy.deepcopy(_PROCESSOR_CACHE[path][0])
+    processor.size["shortest_edge"] = plan["min_pixels"]
+    processor.size["longest_edge"] = plan["max_pixels"]
+    local = threading.local()
+
+    def load(entry):
+        if "s3://" in entry["path"]:
+            config = plan.get("oss_loader_cfg")
+            if config is None or config["backend"] != "petrel":
+                raise RuntimeError("Lazy OSS images require the native petrel configuration")
+            if not hasattr(local, "client"):
+                from petrel_client.client import Client
+                local.client = Client(**config["backend_kwargs"])
+            image = Image.open(io.BytesIO(local.client.get(entry["path"]))).convert("RGB")
+        else:
+            image = load_image(entry["path"])
+        return apply_exif_orientation(image)
+
+    def process(entry):
+        if not hasattr(local, "processor"):
+            local.processor = copy.deepcopy(processor)
+        result = local.processor.preprocess([load(entry)], return_tensors="pt")
+        return result["pixel_values"], result["image_grid_thw"]
+
+    threads = lazy_media_threads()
+    if threads <= 1:
+        # Serial mode keeps native per-source-sample processor calls exactly.
+        parts = []
+        offset = 0
+        for count in plan["sample_sizes"]:
+            images = [load(entry) for entry in plan["images"][offset:offset + count]]
+            result = processor.preprocess(images, return_tensors="pt")
+            parts.append((result["pixel_values"], result["image_grid_thw"]))
+            offset += count
+    else:
+        # Same per-image strategy as #2201; parity is tested with the real processors.
+        with ThreadPoolExecutor(max_workers=threads) as pool:
+            parts = list(pool.map(process, plan["images"]))
+    pixels = torch.cat([part[0] for part in parts])
+    grid = torch.cat([part[1] for part in parts])
+    expected = torch.tensor([entry["grid"] for entry in plan["images"]], dtype=grid.dtype)
+    if pixels.dtype != torch.float32 or not torch.equal(grid, expected):
+        raise RuntimeError("Lazy Qwen pixels dtype or processed grid differs from the native plan")
+    return pixels, grid
 
 
 def smart_get_thw(image_size, image_processor):
@@ -309,6 +369,8 @@ class Qwen3VLTokenizeFunction(BaseMLLMTokenizeFunction):
         enable_thinking: bool | None = None,
     ):
         self.oss_loader = None
+        self._lazy_oss_cfg = oss_loader_cfg.model_dump() if oss_loader_cfg is not None else None
+        self.processor_path = processor_path
         self.debug = debug
         self.oss_time_log_thr = oss_time_log_thr
         self.enable_3d_rope = enable_3d_rope
@@ -567,22 +629,45 @@ class Qwen3VLTokenizeFunction(BaseMLLMTokenizeFunction):
         return {"num_tokens": len(input_ids), "num_img_tokens": (sum_media_grid_thw * self.merge_length).tolist()}
 
     def multi_modal_get_item(self, data_item: dict, media_root: str = "") -> QwenVL3DataItem:
-        image_data_list = []
-        for image_file in self._image_path:
-            image_path_ = get_image_path(image_file, media_root)
-            if self.oss_loader is not None and "s3://" in image_path_:
-                img_str = self.oss_loader.client.get(image_path_)
-                buff = io.BytesIO(img_str)
-                image = Image.open(buff).convert("RGB")
-            else:
-                assert "s3://" not in image_path_, "Please use oss_loader_cfg to load image from s3."
-                image = load_image(image_path_)
-            image = apply_exif_orientation(image)
-            image_data_list.append(image)
+        from .glm53_vl_tokenize_fn import lazy_media_enabled
 
-        visual_processed = self.image_processor.preprocess(image_data_list, return_tensors="pt")
-        image_tensor = visual_processed["pixel_values"]
-        grid_thw = visual_processed["image_grid_thw"]  # b,3
+        plan = None
+        grids = None
+        if lazy_media_enabled() and self.chat_template_name in LAZY_CHAT_TEMPLATES:
+            try:
+                if len(self._image_wh_list) == len(self._image_path) and self._image_path:
+                    grids = [smart_get_thw(size, self.image_processor) for size in self._image_wh_list]
+            except (TypeError, ValueError, ZeroDivisionError, OverflowError):
+                grids = None
+        if grids is not None:
+            grid_thw = torch.tensor(grids, dtype=torch.int64)
+            plan = {
+                "processor_family": "qwen",
+                "images": [{"path": get_image_path(path, media_root), "grid": grid}
+                           for path, grid in zip(self._image_path, grids)],
+                "sample_sizes": [len(grids)],
+                "processor_path": self.processor_path,
+                "min_pixels": self.image_processor.size["shortest_edge"],
+                "max_pixels": self.image_processor.size["longest_edge"],
+                "oss_loader_cfg": self._lazy_oss_cfg,
+            }
+        else:
+            image_data_list = []
+            for image_file in self._image_path:
+                image_path_ = get_image_path(image_file, media_root)
+                if self.oss_loader is not None and "s3://" in image_path_:
+                    img_str = self.oss_loader.client.get(image_path_)
+                    buff = io.BytesIO(img_str)
+                    image = Image.open(buff).convert("RGB")
+                else:
+                    assert "s3://" not in image_path_, "Please use oss_loader_cfg to load image from s3."
+                    image = load_image(image_path_)
+                image = apply_exif_orientation(image)
+                image_data_list.append(image)
+
+            visual_processed = self.image_processor.preprocess(image_data_list, return_tensors="pt")
+            image_tensor = visual_processed["pixel_values"]
+            grid_thw = visual_processed["image_grid_thw"]  # b,3
         grid_thw_merged = [merged_thw.prod().item() // self.merge_length for merged_thw in grid_thw]  # type: ignore
 
         is_pretrain = False
@@ -643,13 +728,16 @@ class Qwen3VLTokenizeFunction(BaseMLLMTokenizeFunction):
         ret = QwenVL3DataItem(
             input_ids=input_ids,
             labels=labels,
-            pixel_values=image_tensor,  # (n,d)
             image_grid_thw=grid_thw,  # b,3
             position_ids=position_ids,
             num_tokens=len(input_ids),
             num_img_tokens=grid_thw.prod(dim=1).tolist(),
             num_imgs=[len(self._image_path)],
         )
+        if plan is None:
+            ret["pixel_values"] = image_tensor
+        else:
+            ret["media_plan"] = plan
         return ret
 
     def calc_frame_info(self, data_item):

@@ -399,6 +399,8 @@ class SequenceContext:
                 {
                     "images": [entry for plan in media_plans for entry in plan["images"]],
                     "sample_sizes": [size for plan in media_plans for size in plan["sample_sizes"]],
+                    **{key: media_plans[0][key] for key in ("processor_family", "oss_loader_cfg")
+                       if key in media_plans[0]},
                     "processor_path": media_plans[0]["processor_path"],
                     "min_pixels": media_plans[0].get("min_pixels"),
                     "max_pixels": media_plans[0].get("max_pixels"),
