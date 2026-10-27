@@ -40,7 +40,7 @@ Whole-process-tree steady PSS from equal-length R1 runs: SP8 399.7→278.2 GiB (
 
 SP8 encountered OOMs. Both resumed arms use an experiment-side one-time torch.cuda.empty_cache() after the first resumed backward and before clipping, to release unused reserved allocations. This hook is not in the production patch and does not modify live tensor values. Its BASE no-hook comparison is included as CSV. OOM attempts were retried; failed run directories were removed by the experiment launcher, so successful trajectories alone do not establish robustness at this memory margin.
 
-Forty steps did not cross an epoch. GPU video training and OSS input were not exercised. CPU tests cover video fields and cross-epoch DataLoader state, but do not substitute for those missing GPU cases. BASE does not checkpoint all training RNG state. These results do not validate TP>1.
+OSS input was not exercised. BASE does not checkpoint all training RNG state. These results do not validate TP>1.
 
 ## Individual plots
 
